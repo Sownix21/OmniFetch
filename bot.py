@@ -20,7 +20,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 
 import requests
 import yt_dlp
@@ -36,21 +36,58 @@ from telegram.ext import MessageHandler, filters
 load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent
 DB_FILE, DOWNLOAD_DIR = BASE_DIR / "database.json", BASE_DIR / "downloads"
+
+
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name, str(default)).strip()
+    try:
+        return int(value or default)
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be a whole number, not {value!r}") from exc
+
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
+ADMIN_ID = env_int("ADMIN_ID", 0)
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip()
-MAX_UPLOAD_MB = max(1, int(os.getenv("MAX_UPLOAD_MB", "49")))
-MAX_PLAYLIST_ITEMS = max(1, int(os.getenv("MAX_PLAYLIST_ITEMS", "10")))
-MAX_CONCURRENT_DOWNLOADS = max(1, int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2")))
-REQUEST_TIMEOUT = max(5, int(os.getenv("REQUEST_TIMEOUT", "20")))
+BOT_API_URL = os.getenv("BOT_API_URL", "").strip().rstrip("/")
+LOCAL_BOT_API = bool(BOT_API_URL)
+if LOCAL_BOT_API:
+    try:
+        parsed_bot_api = urlparse(BOT_API_URL)
+    except ValueError as exc:
+        raise SystemExit("BOT_API_URL is malformed") from exc
+    bot_api_host = (parsed_bot_api.hostname or "").lower()
+    try:
+        loopback_host = bot_api_host == "localhost" or ipaddress.ip_address(bot_api_host).is_loopback
+        parsed_bot_api.port
+    except ValueError:
+        loopback_host = False
+    if parsed_bot_api.scheme != "http" or not loopback_host or parsed_bot_api.path not in {"", "/"} or parsed_bot_api.username or parsed_bot_api.password or parsed_bot_api.query or parsed_bot_api.fragment:
+        raise SystemExit("BOT_API_URL must be a private loopback HTTP endpoint such as http://127.0.0.1:8081")
+upload_setting = os.getenv("MAX_UPLOAD_MB", "").strip()
+if LOCAL_BOT_API and upload_setting in {"", "49"}:
+    upload_setting = "1900"
+try:
+    upload_limit = int(upload_setting or "49")
+except ValueError as exc:
+    raise SystemExit(f"MAX_UPLOAD_MB must be a whole number, not {upload_setting!r}") from exc
+MAX_UPLOAD_MB = min(1990 if LOCAL_BOT_API else 49, max(1, upload_limit))
+MAX_DOWNLOAD_MB = max(MAX_UPLOAD_MB, env_int("MAX_DOWNLOAD_MB", 500))
+MAX_PLAYLIST_ITEMS = max(1, env_int("MAX_PLAYLIST_ITEMS", 10))
+MAX_CONCURRENT_DOWNLOADS = max(1, env_int("MAX_CONCURRENT_DOWNLOADS", 2))
+REQUEST_TIMEOUT = max(5, env_int("REQUEST_TIMEOUT", 20))
+TRANSFER_TIMEOUT = max(120, env_int("TRANSFER_TIMEOUT", 3600 if LOCAL_BOT_API else 180))
+MIN_FREE_DISK_MB = max(256, env_int("MIN_FREE_DISK_MB", 1024))
 URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
 LANGS = {"en", "fa", "ru", "zh"}
 DB_LOCK = threading.RLock()
 DOWNLOAD_SEMAPHORE: asyncio.Semaphore | None = None
+ACTIVE_DOWNLOADS: set[int] = set()
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("omnifetch")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # Avoid leaking token-bearing Bot API URLs in verbose logs.
 
 LANG = {
     "en": {
@@ -58,8 +95,8 @@ LANG = {
         "unauth": "🚫 You are not authorized. Ask the bot administrator for access.",
         "fetching": "🔎 Fetching details…", "wait": "⏳ Download queued…",
         "uploading": "📤 Download complete. Uploading…", "btn_lang": "🌍 Language",
-        "btn_help": "✨ Features & Help", "btn_admin": "👑 Admin Panel",
-        "help": "✨ <b>What I can do</b>\n\n• Download video or audio from sites supported by yt-dlp\n• Handle playlists (with an admin limit)\n• Download Spotify links through spotDL\n• Preview GitHub repositories, releases, and files\n• Show Google Play app details\n\nSome sites require cookies. Only download content you are legally allowed to access.",
+        "btn_help": "✨ Features & Help", "btn_status": "📊 Bot Status", "btn_admin": "👑 Admin Panel",
+        "help": "✨ <b>What I can do</b>\n\n• Send video/audio from YouTube, TikTok, Instagram, X, adult sites, and other yt-dlp extractors\n• Process supported playlists and Spotify tracks/playlists\n• Upload GitHub source, releases, READMEs, and repository files\n• Show Google Play details and send available APKs\n• Deliver direct file links inside this chat\n\nSome sites require cookies. DRM and inaccessible/private content cannot be bypassed. Only download content you are legally allowed to access.",
         "lang_ok": "✅ Language updated.", "send_link": "🔗 Send a valid http(s) link, or use the menu below.",
     },
     "fa": {
@@ -67,7 +104,7 @@ LANG = {
         "unauth": "🚫 شما مجاز نیستید. از مدیر ربات درخواست دسترسی کنید.",
         "fetching": "🔎 در حال دریافت اطلاعات…", "wait": "⏳ دانلود در صف قرار گرفت…",
         "uploading": "📤 دانلود تمام شد؛ در حال ارسال…", "btn_lang": "🌍 تغییر زبان",
-        "btn_help": "✨ امکانات و راهنما", "btn_admin": "👑 پنل مدیریت",
+        "btn_help": "✨ امکانات و راهنما", "btn_status": "📊 وضعیت ربات", "btn_admin": "👑 پنل مدیریت",
         "help": "✨ <b>امکانات</b>\n\n• دانلود از سایت‌های پشتیبانی‌شده توسط yt-dlp\n• پلی‌لیست با محدودیت مدیر\n• دریافت آهنگ با spotDL\n• نمایش مخزن‌های گیت‌هاب\n• اطلاعات گوگل‌پلی\n\nفقط محتوایی را دانلود کنید که اجازه قانونی آن را دارید.",
         "lang_ok": "✅ زبان تغییر کرد.", "send_link": "🔗 یک لینک معتبر http(s) بفرستید یا از منو استفاده کنید.",
     },
@@ -76,7 +113,7 @@ LANG = {
         "unauth": "🚫 У вас нет доступа. Обратитесь к администратору.",
         "fetching": "🔎 Получаю информацию…", "wait": "⏳ Загрузка в очереди…",
         "uploading": "📤 Файл готов. Отправляю…", "btn_lang": "🌍 Язык",
-        "btn_help": "✨ Возможности", "btn_admin": "👑 Панель администратора",
+        "btn_help": "✨ Возможности", "btn_status": "📊 Статус бота", "btn_admin": "👑 Панель администратора",
         "help": "✨ <b>Возможности</b>\n\n• Видео и аудио с сайтов yt-dlp\n• Плейлисты с лимитом\n• Spotify через spotDL\n• GitHub и Google Play\n\nСкачивайте только разрешённый контент.",
         "lang_ok": "✅ Язык обновлён.", "send_link": "🔗 Отправьте корректную http(s)-ссылку.",
     },
@@ -84,7 +121,7 @@ LANG = {
         "welcome": "🌌 <b>欢迎使用 OmniFetch</b>\n\n请发送媒体、GitHub、Spotify 或 Google Play 链接。",
         "unauth": "🚫 您没有访问权限，请联系管理员。", "fetching": "🔎 正在获取信息…",
         "wait": "⏳ 下载已排队…", "uploading": "📤 下载完成，正在发送…",
-        "btn_lang": "🌍 语言", "btn_help": "✨ 功能与帮助", "btn_admin": "👑 管理面板",
+        "btn_lang": "🌍 语言", "btn_help": "✨ 功能与帮助", "btn_status": "📊 机器人状态", "btn_admin": "👑 管理面板",
         "help": "✨ <b>功能</b>\n\n• 从 yt-dlp 支持的网站下载\n• 播放列表支持\n• spotDL、GitHub 和 Google Play\n\n请只下载您有权访问的内容。",
         "lang_ok": "✅ 语言已更新。", "send_link": "🔗 请发送有效的 http(s) 链接。",
     },
@@ -131,7 +168,7 @@ def set_user(user_id: int, allowed: bool | None = None, lang: str | None = None)
 
 
 def main_menu(user_id: int) -> ReplyKeyboardMarkup:
-    rows = [[KeyboardButton(text(user_id, "btn_lang")), KeyboardButton(text(user_id, "btn_help"))]]
+    rows = [[KeyboardButton(text(user_id, "btn_lang")), KeyboardButton(text(user_id, "btn_status"))], [KeyboardButton(text(user_id, "btn_help"))]]
     if user_id == ADMIN_ID: rows.append([KeyboardButton(text(user_id, "btn_admin"))])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, input_field_placeholder="🔗 Paste a link…")
 
@@ -146,17 +183,21 @@ def extract_url(value: str) -> str | None:
     return match.group(0).rstrip(".,;:!?)]}\"") if match else None
 
 
-async def validate_url(url: str) -> tuple[bool, str]:
+def validate_public_url(url: str) -> tuple[bool, str]:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname: return False, "Only valid http(s) links are supported."
     if parsed.username or parsed.password: return False, "Links containing credentials are not allowed."
     host = parsed.hostname.lower().rstrip(".")
     if host == "localhost" or host.endswith(".local"): return False, "Local network addresses are not allowed."
     try:
-        results = await asyncio.to_thread(socket.getaddrinfo, host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+        results = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
         if any(not ipaddress.ip_address(item[4][0]).is_global for item in results): return False, "Private or reserved addresses are not allowed."
     except (socket.gaierror, ValueError, OSError): return False, "That host could not be resolved."
     return True, ""
+
+
+async def validate_url(url: str) -> tuple[bool, str]:
+    return await asyncio.to_thread(validate_public_url, url)
 
 
 def remember(context: ContextTypes.DEFAULT_TYPE, payload: dict[str, Any]) -> str:
@@ -184,18 +225,40 @@ def safe_filename(value: str, fallback: str = "download") -> str:
 
 
 def download_http_file(url: str, destination: Path, filename: str) -> Path:
-    """Stream an approved URL to disk while enforcing the bot upload limit."""
-    headers = {"Accept": "application/octet-stream", "User-Agent": "OmniFetch"}
-    host = (urlparse(url).hostname or "").lower()
-    if GITHUB_TOKEN and (host == "github.com" or host.endswith(".github.com") or host.endswith(".githubusercontent.com")):
-        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
-    limit = MAX_UPLOAD_MB * 1024 * 1024
+    """Stream an approved URL to disk while enforcing the download ceiling."""
+    limit = MAX_DOWNLOAD_MB * 1024 * 1024
     path = destination / safe_filename(filename)
-    with requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, stream=True, allow_redirects=True) as response:
+    current_url = url
+    response: requests.Response | None = None
+    for _ in range(6):
+        valid, reason = validate_public_url(current_url)
+        if not valid:
+            raise RuntimeError(f"Blocked unsafe download URL: {reason}")
+        headers = {"Accept": "application/octet-stream", "User-Agent": "OmniFetch"}
+        host = (urlparse(current_url).hostname or "").lower()
+        if GITHUB_TOKEN and (host == "github.com" or host.endswith(".github.com") or host.endswith(".githubusercontent.com")):
+            headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+        response = requests.get(current_url, headers=headers, timeout=REQUEST_TIMEOUT, stream=True, allow_redirects=False)
+        if not response.is_redirect:
+            break
+        location = response.headers.get("Location")
+        response.close()
+        if not location:
+            raise RuntimeError("Download redirect did not include a destination")
+        current_url = urljoin(current_url, location)
+    else:
+        raise RuntimeError("Download exceeded the redirect limit")
+    assert response is not None
+    with response:
         response.raise_for_status()
         declared = int(response.headers.get("Content-Length", "0") or 0)
         if declared > limit:
-            raise RuntimeError(f"GitHub file is {declared / 1024 / 1024:.1f} MB; Telegram limit is {MAX_UPLOAD_MB} MB")
+            raise RuntimeError(f"File is {declared / 1024 / 1024:.1f} MB; bot download ceiling is {MAX_DOWNLOAD_MB} MB")
+        required = declared or limit
+        free = shutil.disk_usage(destination).free
+        reserve = MIN_FREE_DISK_MB * 1024 * 1024
+        if free < required + reserve:
+            raise RuntimeError(f"Not enough VPS disk space; {MIN_FREE_DISK_MB} MB must remain free")
         written = 0
         with path.open("wb") as output:
             for chunk in response.iter_content(chunk_size=256 * 1024):
@@ -203,7 +266,7 @@ def download_http_file(url: str, destination: Path, filename: str) -> Path:
                     continue
                 written += len(chunk)
                 if written > limit:
-                    raise RuntimeError(f"GitHub file exceeds the {MAX_UPLOAD_MB} MB Telegram limit")
+                    raise RuntimeError(f"File exceeds the {MAX_DOWNLOAD_MB} MB bot download ceiling")
                 output.write(chunk)
     return path
 
@@ -212,6 +275,34 @@ def github_item(job: dict[str, Any], payload: dict[str, Any]) -> str:
     key = uuid.uuid4().hex[:8]
     job.setdefault("github_items", {})[key] = payload
     return key
+
+
+def ensure_download_capacity() -> None:
+    DOWNLOAD_DIR.mkdir(exist_ok=True)
+    free = shutil.disk_usage(DOWNLOAD_DIR).free
+    required = (MAX_DOWNLOAD_MB + MIN_FREE_DISK_MB) * 1024 * 1024
+    if free < required:
+        raise RuntimeError(f"VPS needs at least {MAX_DOWNLOAD_MB + MIN_FREE_DISK_MB} MB free before starting this download")
+
+
+def cleanup_stale_downloads(max_age_seconds: int = 24 * 3600) -> None:
+    if not DOWNLOAD_DIR.exists():
+        return
+    cutoff = time.time() - max_age_seconds
+    for item in DOWNLOAD_DIR.iterdir():
+        try:
+            if item.stat().st_mtime < cutoff:
+                if item.is_dir(): shutil.rmtree(item, ignore_errors=True)
+                else: item.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("Could not clean stale download %s: %s", item, exc)
+
+
+def download_semaphore() -> asyncio.Semaphore:
+    global DOWNLOAD_SEMAPHORE
+    if DOWNLOAD_SEMAPHORE is None:
+        DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+    return DOWNLOAD_SEMAPHORE
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -229,7 +320,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message and update.effective_user and authorized(update.effective_user.id):
-        await update.message.reply_text(f"🟢 <b>OmniFetch is online</b>\n📦 Playlist limit: {MAX_PLAYLIST_ITEMS}\n📤 Upload limit: {MAX_UPLOAD_MB} MB\n⚙️ Download workers: {MAX_CONCURRENT_DOWNLOADS}", parse_mode=ParseMode.HTML)
+        mode = "Local Bot API" if LOCAL_BOT_API else "Hosted Bot API"
+        free_mb = shutil.disk_usage(BASE_DIR).free / 1024 / 1024
+        await update.message.reply_text(f"🟢 <b>OmniFetch is online</b>\n🔌 {mode}\n📦 Playlist limit: {MAX_PLAYLIST_ITEMS}\n📤 Single-file limit: {MAX_UPLOAD_MB} MB\n⬇️ Download ceiling: {MAX_DOWNLOAD_MB} MB\n💽 Free disk: {free_mb:,.0f} MB\n⚙️ Download workers: {MAX_CONCURRENT_DOWNLOADS}", parse_mode=ParseMode.HTML)
 
 
 async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -272,6 +365,7 @@ async def message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         keys = [[InlineKeyboardButton("🇺🇸 English", callback_data="lang:en"), InlineKeyboardButton("🇮🇷 فارسی", callback_data="lang:fa")], [InlineKeyboardButton("🇷🇺 Русский", callback_data="lang:ru"), InlineKeyboardButton("🇨🇳 中文", callback_data="lang:zh")]]
         await update.message.reply_text("🌍 Choose your language:", reply_markup=InlineKeyboardMarkup(keys)); return
     if value.startswith(("✨", "ℹ️")): await help_command(update, context); return
+    if value.startswith("📊"): await status_command(update, context); return
     if value.startswith("👑") and uid == ADMIN_ID: await update.message.reply_text("👑 <b>Admin panel</b>", parse_mode=ParseMode.HTML, reply_markup=admin_menu()); return
     if value.startswith("🔙") and uid == ADMIN_ID: await update.message.reply_text("🏠 Main menu", reply_markup=main_menu(uid)); return
     if value.startswith("📋") and uid == ADMIN_ID: await users_command(update, context); return
@@ -376,21 +470,71 @@ async def github_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         log.warning("GitHub callback failed: %s", exc); await query.message.reply_text("❌ Could not load that view.")
 
 
+def split_large_file(path: Path, chunk_size: int) -> list[Path]:
+    parts: list[Path] = []
+    with path.open("rb") as source:
+        index = 1
+        while chunk := source.read(chunk_size):
+            part = path.with_name(f"{path.name}.part{index:03d}")
+            part.write_bytes(chunk); parts.append(part); index += 1
+    return parts
+
+
+async def send_large_file_parts(context: ContextTypes.DEFAULT_TYPE, chat_id: int, path: Path) -> None:
+    chunk_size = MAX_UPLOAD_MB * 1024 * 1024
+    parts = await asyncio.to_thread(split_large_file, path, chunk_size)
+    names = [part.name for part in parts]
+    linux_command = f"cat '{path.name}.part'* > '{path.name}'"
+    windows_sources = "+".join(f'"{name}"' for name in names)
+    windows_command = f'copy /b {windows_sources} "{path.name}"'
+    await context.bot.send_message(
+        chat_id,
+        f"🧩 <b>Large file split into {len(parts)} parts</b>\nOriginal: <code>{html.escape(path.name)}</code>\n\n"
+        f"After downloading every part, rebuild it:\n🐧 <code>{html.escape(linux_command)}</code>\n"
+        f"🪟 <code>{html.escape(windows_command)}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+    for index, part in enumerate(parts, 1):
+        with part.open("rb") as document:
+            await context.bot.send_document(chat_id, document, caption=f"🧩 {path.name} · part {index}/{len(parts)}", read_timeout=TRANSFER_TIMEOUT, write_timeout=TRANSFER_TIMEOUT)
+
+
 async def send_remote_document(message: Any, context: ContextTypes.DEFAULT_TYPE, url: str, filename: str, source: str = "GitHub") -> None:
     filename = safe_filename(filename)
-    status = await message.reply_text(f"⬇️ Downloading <code>{html.escape(filename)}</code> from {html.escape(source)}…", parse_mode=ParseMode.HTML)
-    DOWNLOAD_DIR.mkdir(exist_ok=True); work = Path(tempfile.mkdtemp(prefix="github-", dir=DOWNLOAD_DIR))
+    active_key = message.chat_id
+    if active_key in ACTIVE_DOWNLOADS:
+        await message.reply_text("⏳ This chat already has an active download. Please wait for it to finish."); return
+    ACTIVE_DOWNLOADS.add(active_key)
+    status = None
+    work: Path | None = None
     try:
-        path = await asyncio.to_thread(download_http_file, url, work, filename)
+        status = await message.reply_text(f"⬇️ Downloading <code>{html.escape(filename)}</code> from {html.escape(source)}…", parse_mode=ParseMode.HTML)
+        DOWNLOAD_DIR.mkdir(exist_ok=True); work = Path(tempfile.mkdtemp(prefix="remote-", dir=DOWNLOAD_DIR))
+        async with download_semaphore():
+            path = await asyncio.to_thread(download_http_file, url, work, filename)
         await status.edit_text("📤 Uploading to Telegram…")
-        with path.open("rb") as document:
-            await context.bot.send_document(message.chat_id, document, caption=f"✅ {filename}", read_timeout=120, write_timeout=120)
-        await status.delete()
-    except (requests.RequestException, RuntimeError, OSError, TelegramError) as exc:
-        log.warning("GitHub file download failed: %s", exc)
-        await status.edit_text(f"❌ Could not send this file.\n<code>{html.escape(str(exc)[:350])}</code>", parse_mode=ParseMode.HTML)
+        is_installable_package = path.suffix.lower() in {".apk", ".apks", ".xapk"}
+        if path.stat().st_size > MAX_UPLOAD_MB * 1024 * 1024 and is_installable_package:
+            api_description = "configured local Bot API" if LOCAL_BOT_API else "Telegram hosted Bot API"
+            await status.edit_text(
+                f"⚠️ <b>This APK must remain one file.</b>\nIt is {path.stat().st_size / 1024 / 1024:.1f} MB, but the {api_description} single-file limit is configured as {MAX_UPLOAD_MB} MB.\n\nConfigure <code>BOT_API_URL</code> and a larger <code>MAX_UPLOAD_MB</code> to send it intact.",
+                parse_mode=ParseMode.HTML,
+            ); return
+        if path.stat().st_size > MAX_UPLOAD_MB * 1024 * 1024:
+            await send_large_file_parts(context, message.chat_id, path)
+        else:
+            with path.open("rb") as document:
+                await context.bot.send_document(message.chat_id, document, caption=f"✅ {filename}", read_timeout=TRANSFER_TIMEOUT, write_timeout=TRANSFER_TIMEOUT)
+        try: await status.delete()
+        except TelegramError: pass
+    except (requests.RequestException, RuntimeError, OSError, TelegramError, ValueError) as exc:
+        log.warning("Remote file delivery failed: %s", exc)
+        if status:
+            try: await status.edit_text(f"❌ Could not send this file.\n<code>{html.escape(str(exc)[:350])}</code>", parse_mode=ParseMode.HTML)
+            except TelegramError: pass
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        if work: shutil.rmtree(work, ignore_errors=True)
+        ACTIVE_DOWNLOADS.discard(active_key)
 
 
 async def send_github_browser(message: Any, job: dict[str, Any], token: str, path: str) -> None:
@@ -453,7 +597,7 @@ async def apk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 def ytdlp_options(action: str, output: Path) -> dict[str, Any]:
     limit = MAX_UPLOAD_MB * 1024 * 1024
-    opts: dict[str, Any] = {"outtmpl": str(output / "%(playlist_index&{} - |)s%(title).180B [%(id)s].%(ext)s"), "quiet": True, "no_warnings": True, "playlistend": MAX_PLAYLIST_ITEMS, "windowsfilenames": True, "retries": 3, "fragment_retries": 3, "socket_timeout": REQUEST_TIMEOUT}
+    opts: dict[str, Any] = {"outtmpl": str(output / "%(playlist_index&{} - |)s%(title).180B [%(id)s].%(ext)s"), "quiet": True, "no_warnings": True, "playlistend": MAX_PLAYLIST_ITEMS, "windowsfilenames": True, "retries": 3, "fragment_retries": 3, "socket_timeout": REQUEST_TIMEOUT, "max_filesize": MAX_DOWNLOAD_MB * 1024 * 1024}
     if COOKIES_FILE: opts["cookiefile"] = COOKIES_FILE
     if action == "best": opts.update({"format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best", "merge_output_format": "mp4"})
     elif action == "safe": opts.update({"format": f"best[filesize<={limit}]/best[filesize_approx<={limit}]/bestvideo[filesize<={int(limit*.82)}]+bestaudio[filesize<={int(limit*.18)}]/best", "merge_output_format": "mp4", "max_filesize": limit})
@@ -462,28 +606,63 @@ def ytdlp_options(action: str, output: Path) -> dict[str, Any]:
     return opts
 
 
+async def run_subprocess(args: list[str], timeout: int = TRANSFER_TIMEOUT) -> str:
+    process = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    try:
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except TimeoutError as exc:
+        process.kill(); await process.communicate()
+        raise RuntimeError(f"Download process exceeded the {timeout}-second timeout") from exc
+    output = stdout.decode(errors="replace")
+    if process.returncode:
+        raise RuntimeError(output[-600:].strip() or f"Download process exited with code {process.returncode}")
+    return output
+
+
+def limit_spotdl_metadata(path: Path) -> int:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, list):
+        songs = data
+    elif isinstance(data, dict) and isinstance(data.get("songs"), list):
+        songs = data["songs"]
+    else:
+        raise RuntimeError("spotDL returned an unsupported metadata format")
+    original_count = len(songs)
+    del songs[MAX_PLAYLIST_ITEMS:]
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    return original_count
+
+
 async def run_spotdl(url: str, fmt: str, output: Path) -> None:
     executable = shutil.which("spotdl") or str(Path(sys.executable).parent / ("spotdl.exe" if os.name == "nt" else "spotdl"))
     if not Path(executable).exists(): raise RuntimeError("spotDL is not installed")
-    process = await asyncio.create_subprocess_exec(executable, "download", url, "--format", fmt, "--output", str(output / "{artists} - {title}.{output-ext}"), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-    stdout, _ = await process.communicate()
-    if process.returncode: raise RuntimeError(stdout.decode(errors="replace")[-600:].strip() or "spotDL failed")
+    metadata = output / "selection.spotdl"
+    await run_subprocess([executable, "save", url, "--save-file", str(metadata)])
+    count = await asyncio.to_thread(limit_spotdl_metadata, metadata)
+    if not count: raise RuntimeError("The Spotify link contained no downloadable tracks")
+    args = [executable, "download", str(metadata), "--format", fmt, "--threads", str(MAX_CONCURRENT_DOWNLOADS), "--output", str(output / "{artists} - {title}.{output-ext}"), "--yt-dlp-args", f"--max-filesize {MAX_DOWNLOAD_MB}M --socket-timeout {REQUEST_TIMEOUT}"]
+    if COOKIES_FILE: args.extend(["--cookie-file", COOKIES_FILE])
+    await run_subprocess(args)
 
 
 def files_in(path: Path) -> list[Path]:
-    return sorted((item for item in path.rglob("*") if item.is_file() and item.suffix.lower() not in {".part", ".ytdl", ".temp"}), key=lambda item: item.name)
+    return sorted((item for item in path.rglob("*") if item.is_file() and item.suffix.lower() not in {".part", ".ytdl", ".temp", ".spotdl"}), key=lambda item: item.name)
 
 
 async def upload(context: ContextTypes.DEFAULT_TYPE, chat_id: int, path: Path) -> bool:
     size = path.stat().st_size / 1024 / 1024
     if size > MAX_UPLOAD_MB:
-        await context.bot.send_message(chat_id, f"⚠️ <code>{html.escape(path.name)}</code> is {size:.1f} MB (limit: {MAX_UPLOAD_MB} MB).", parse_mode=ParseMode.HTML); return False
+        if size > MAX_DOWNLOAD_MB:
+            await context.bot.send_message(chat_id, f"⚠️ <code>{html.escape(path.name)}</code> is {size:.1f} MB (download ceiling: {MAX_DOWNLOAD_MB} MB).", parse_mode=ParseMode.HTML); return False
+        if path.suffix.lower() in {".apk", ".apks", ".xapk"}:
+            await context.bot.send_message(chat_id, "⚠️ This Android package is too large for the configured single-file limit and will not be split. Configure a local Bot API server to send it intact."); return False
+        await send_large_file_parts(context, chat_id, path); return True
     with path.open("rb") as file:
-        if path.suffix.lower() in {".mp3", ".flac", ".m4a", ".ogg", ".opus", ".wav"}: await context.bot.send_audio(chat_id, file, read_timeout=120, write_timeout=120)
+        if path.suffix.lower() in {".mp3", ".flac", ".m4a", ".ogg", ".opus", ".wav"}: await context.bot.send_audio(chat_id, file, read_timeout=TRANSFER_TIMEOUT, write_timeout=TRANSFER_TIMEOUT)
         elif path.suffix.lower() in {".mp4", ".m4v", ".mov"}:
-            try: await context.bot.send_video(chat_id, file, supports_streaming=True, read_timeout=120, write_timeout=120)
-            except BadRequest: file.seek(0); await context.bot.send_document(chat_id, file, read_timeout=120, write_timeout=120)
-        else: await context.bot.send_document(chat_id, file, read_timeout=120, write_timeout=120)
+            try: await context.bot.send_video(chat_id, file, supports_streaming=True, read_timeout=TRANSFER_TIMEOUT, write_timeout=TRANSFER_TIMEOUT)
+            except BadRequest: file.seek(0); await context.bot.send_document(chat_id, file, read_timeout=TRANSFER_TIMEOUT, write_timeout=TRANSFER_TIMEOUT)
+        else: await context.bot.send_document(chat_id, file, read_timeout=TRANSFER_TIMEOUT, write_timeout=TRANSFER_TIMEOUT)
     return True
 
 
@@ -498,11 +677,25 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         filename = safe_filename(unquote(Path(urlparse(job["url"]).path).name), "download.bin")
         await send_remote_document(query.message, context, job["url"], filename, "source website")
         return
-    status = await query.message.reply_text(text(uid, "wait")); DOWNLOAD_DIR.mkdir(exist_ok=True); work = Path(tempfile.mkdtemp(prefix=f"{uid}-", dir=DOWNLOAD_DIR))
-    global DOWNLOAD_SEMAPHORE
-    if DOWNLOAD_SEMAPHORE is None: DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+    if uid in ACTIVE_DOWNLOADS:
+        await query.message.reply_text("⏳ You already have an active download. Please wait for it to finish."); return
+    ACTIVE_DOWNLOADS.add(uid)
+    status = None
     try:
-        async with DOWNLOAD_SEMAPHORE:
+        status = await query.message.reply_text(text(uid, "wait"))
+        ensure_download_capacity()
+    except RuntimeError as exc:
+        ACTIVE_DOWNLOADS.discard(uid)
+        if status: await status.edit_text(f"❌ {html.escape(str(exc))}")
+        return
+    except TelegramError:
+        ACTIVE_DOWNLOADS.discard(uid)
+        return
+    assert status is not None
+    work: Path | None = None
+    try:
+        work = Path(tempfile.mkdtemp(prefix=f"{uid}-", dir=DOWNLOAD_DIR))
+        async with download_semaphore():
             await status.edit_text("⬇️ Downloading and processing…")
             if job["kind"] == "spotify": await run_spotdl(job["url"], "flac" if action == "sfl" else "mp3", work)
             else: await asyncio.to_thread(yt_dlp.YoutubeDL(ytdlp_options(action, work)).download, [job["url"]])
@@ -515,7 +708,9 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         log.warning("Download failed for %s: %s", uid, exc); detail = str(exc).splitlines()[-1][:350]
         hint = "\n\n💡 This site may require COOKIES_FILE." if any(word in detail.lower() for word in ("cookie", "sign in", "age")) else ""
         await status.edit_text(f"❌ Download failed.\n<code>{html.escape(detail)}</code>{hint}", parse_mode=ParseMode.HTML)
-    finally: shutil.rmtree(work, ignore_errors=True)
+    finally:
+        if work: shutil.rmtree(work, ignore_errors=True)
+        ACTIVE_DOWNLOADS.discard(uid)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -523,6 +718,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def post_init(application: Application) -> None:
+    await asyncio.to_thread(cleanup_stale_downloads)
     await application.bot.set_my_commands([BotCommand("start", "Open OmniFetch"), BotCommand("help", "Features and help"), BotCommand("status", "Bot limits and status"), BotCommand("id", "Your Telegram ID")])
 
 
@@ -530,7 +726,11 @@ def main() -> None:
     if not BOT_TOKEN: raise SystemExit("BOT_TOKEN is missing. Copy .env.example to .env and configure it.")
     if not ADMIN_ID: raise SystemExit("ADMIN_ID must be a numeric Telegram user ID.")
     if COOKIES_FILE and not Path(COOKIES_FILE).is_file(): log.warning("COOKIES_FILE does not exist: %s", COOKIES_FILE)
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    builder = Application.builder().token(BOT_TOKEN).post_init(post_init).concurrent_updates(max(4, MAX_CONCURRENT_DOWNLOADS * 2))
+    if LOCAL_BOT_API:
+        builder = builder.base_url(f"{BOT_API_URL}/bot").base_file_url(f"{BOT_API_URL}/file/bot").local_mode(True)
+        log.info("Using local Telegram Bot API at %s", BOT_API_URL)
+    app = builder.build()
     for command, callback in (("start", start), ("help", help_command), ("status", status_command), ("id", id_command), ("allow", allow_command), ("revoke", revoke_command), ("users", users_command)): app.add_handler(CommandHandler(command, callback))
     app.add_handler(MessageHandler(filters.StatusUpdate.USERS_SHARED, user_shared))
     app.add_handler(CallbackQueryHandler(language_callback, pattern=r"^lang:(en|fa|ru|zh)$"))
