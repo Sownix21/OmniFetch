@@ -64,7 +64,10 @@ sudo omnifetch update-api
 sudo omnifetch config
 sudo omnifetch api-config
 sudo omnifetch health
+sudo omnifetch uninstall
 ```
+
+`sudo omnifetch uninstall` is also available as option 12 in the menu. It requires typing `UNINSTALL`, then removes both services, the bot database/download directory, private API credentials and data, the compiled API server/source, manager command, and service users. Shared VPS packages and runtimes are deliberately retained.
 
 ## Manual development setup
 

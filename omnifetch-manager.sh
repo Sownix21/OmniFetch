@@ -6,6 +6,7 @@ BOT_SERVICE="omnifetch"
 API_SERVICE="telegram-bot-api"
 API_ENV_FILE="/etc/omnifetch-bot-api.env"
 API_SOURCE_DIR="/usr/local/src/telegram-bot-api"
+API_DATA_DIR="/var/lib/telegram-bot-api"
 API_URL="http://127.0.0.1:8081"
 
 if [[ ${EUID} -ne 0 ]]; then exec sudo "$0" "$@"; fi
@@ -159,6 +160,52 @@ health_check() {
     echo "✅ Python, both services, local authentication, and storage checks passed."
 }
 
+uninstall_all() {
+    check_install
+    local confirmation
+    cat <<'WARNING'
+⚠️  FULL OMNIFETCH UNINSTALL
+
+This permanently removes:
+  • the bot and private Bot API services
+  • /opt/omnifetch-bot, including its database and temporary downloads
+  • private API credentials and all local Bot API session/data files
+  • the compiled Bot API binary/source, Linux manager, and service users
+
+Shared packages and runtimes (Python, FFmpeg, Git, CMake, and Deno) are kept.
+This action cannot be undone unless you have your own backup.
+WARNING
+    [[ -r /dev/tty ]] || { echo "❌ Uninstall requires an interactive terminal."; return 1; }
+    read -r -p "Type UNINSTALL to permanently continue: " confirmation </dev/tty
+    if [[ "$confirmation" != "UNINSTALL" ]]; then
+        echo "✅ Uninstall cancelled; nothing was removed."
+        return 0
+    fi
+    [[ "$(realpath -m "$INSTALL_DIR")" == /opt/omnifetch-bot \
+        && "$(realpath -m "$API_SOURCE_DIR")" == /usr/local/src/telegram-bot-api \
+        && "$(realpath -m "$API_DATA_DIR")" == /var/lib/telegram-bot-api ]] || {
+        echo "❌ Safety check failed; no files were removed."
+        return 1
+    }
+
+    echo "⏹️ Stopping and disabling OmniFetch services"
+    systemctl disable --now "$BOT_SERVICE" "$API_SERVICE" 2>/dev/null || true
+
+    rm -f -- \
+        "/etc/systemd/system/${BOT_SERVICE}.service" \
+        "/etc/systemd/system/${API_SERVICE}.service" \
+        "$API_ENV_FILE" \
+        /usr/local/bin/telegram-bot-api \
+        /usr/local/bin/omnifetch
+    rm -rf -- "$INSTALL_DIR" "$API_SOURCE_DIR" "$API_DATA_DIR"
+
+    id omnifetch >/dev/null 2>&1 && userdel omnifetch || true
+    id telegram-bot-api >/dev/null 2>&1 && userdel telegram-bot-api || true
+    systemctl daemon-reload
+    systemctl reset-failed "$BOT_SERVICE" "$API_SERVICE" 2>/dev/null || true
+    echo "✅ OmniFetch and its private Telegram Bot API were completely removed."
+}
+
 show_menu() {
     check_install
     while true; do
@@ -178,10 +225,11 @@ show_menu() {
 │  9  ⬆️  Update bot + dependencies       │
 │ 10  🧱 Update official local Bot API    │
 │ 11  🩺 Run complete health check        │
-│ 12  🚪 Exit                             │
+│ 12  🗑️  Fully uninstall OmniFetch       │
+│ 13  🚪 Exit                             │
 ╰─────────────────────────────────────────╯
 MENU
-        read -r -p "Choose [1-12]: " choice </dev/tty
+        read -r -p "Choose [1-13]: " choice </dev/tty
         case "$choice" in
             1) start_all; echo "✅ Started both services."; sleep 1 ;;
             2) stop_all; echo "✅ Stopped both services."; sleep 1 ;;
@@ -194,8 +242,9 @@ MENU
             9) update_bot; pause ;;
             10) update_api; pause ;;
             11) health_check || true; pause ;;
-            12) exit 0 ;;
-            *) echo "⚠️ Choose a number from 1 to 12."; sleep 1 ;;
+            12) uninstall_all || true; [[ -d "$INSTALL_DIR" ]] || exit 0; pause ;;
+            13) exit 0 ;;
+            *) echo "⚠️ Choose a number from 1 to 13."; sleep 1 ;;
         esac
     done
 }
@@ -212,6 +261,7 @@ case "${1:-menu}" in
     config) edit_bot_config ;;
     api-config) edit_api_config ;;
     health) health_check ;;
+    uninstall) uninstall_all ;;
     menu) show_menu ;;
-    *) echo "Usage: omnifetch [start|stop|restart|status|logs|api-logs|update|update-api|config|api-config|health]"; exit 2 ;;
+    *) echo "Usage: omnifetch [start|stop|restart|status|logs|api-logs|update|update-api|config|api-config|health|uninstall]"; exit 2 ;;
 esac
