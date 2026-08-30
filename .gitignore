@@ -1,0 +1,17 @@
+.env
+.env.backup
+*.cookies
+cookies.txt
+database.json
+downloads/
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
