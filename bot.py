@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
 import ipaddress
 import json
@@ -19,7 +20,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import requests
 import yt_dlp
@@ -176,6 +177,43 @@ async def api_get(url: str, **kwargs: Any) -> requests.Response:
     return await asyncio.to_thread(requests.get, url, headers=headers, timeout=REQUEST_TIMEOUT, **kwargs)
 
 
+def safe_filename(value: str, fallback: str = "download") -> str:
+    name = Path(value.replace("\\", "/")).name
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+    return (name or fallback)[:180]
+
+
+def download_http_file(url: str, destination: Path, filename: str) -> Path:
+    """Stream an approved URL to disk while enforcing the bot upload limit."""
+    headers = {"Accept": "application/octet-stream", "User-Agent": "OmniFetch"}
+    host = (urlparse(url).hostname or "").lower()
+    if GITHUB_TOKEN and (host == "github.com" or host.endswith(".github.com") or host.endswith(".githubusercontent.com")):
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    limit = MAX_UPLOAD_MB * 1024 * 1024
+    path = destination / safe_filename(filename)
+    with requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, stream=True, allow_redirects=True) as response:
+        response.raise_for_status()
+        declared = int(response.headers.get("Content-Length", "0") or 0)
+        if declared > limit:
+            raise RuntimeError(f"GitHub file is {declared / 1024 / 1024:.1f} MB; Telegram limit is {MAX_UPLOAD_MB} MB")
+        written = 0
+        with path.open("wb") as output:
+            for chunk in response.iter_content(chunk_size=256 * 1024):
+                if not chunk:
+                    continue
+                written += len(chunk)
+                if written > limit:
+                    raise RuntimeError(f"GitHub file exceeds the {MAX_UPLOAD_MB} MB Telegram limit")
+                output.write(chunk)
+    return path
+
+
+def github_item(job: dict[str, Any], payload: dict[str, Any]) -> str:
+    key = uuid.uuid4().hex[:8]
+    job.setdefault("github_items", {})[key] = payload
+    return key
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user: return
     uid = update.effective_user.id
@@ -244,7 +282,7 @@ async def message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     host, path = (urlparse(url).hostname or "").lower(), urlparse(url).path
     if host in {"github.com", "www.github.com"}: await github_menu(update, context, url)
     elif host == "open.spotify.com": await spotify_menu(update, context, url)
-    elif host == "play.google.com" and "/store/apps/details" in path: await playstore(update, url)
+    elif host == "play.google.com" and "/store/apps/details" in path: await playstore(update, context, url)
     else: await media_menu(update, context, url)
 
 
@@ -265,8 +303,9 @@ async def github_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, url: s
     try:
         response = await api_get(f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}")
         if not response.ok: await status.edit_text("❌ Repository not found or GitHub API limit reached."); return
-        data = response.json(); token = remember(context, {"kind": "github", "owner": owner, "repo": repo}); branch = data.get("default_branch", "main")
-        keys = [[InlineKeyboardButton("⬇️ Source ZIP", url=f"https://github.com/{owner}/{repo}/archive/refs/heads/{quote(branch)}.zip")], [InlineKeyboardButton("📖 README", callback_data=f"gh:{token}:readme"), InlineKeyboardButton("🏷 Releases", callback_data=f"gh:{token}:releases")], [InlineKeyboardButton("📂 Browse", callback_data=f"gh:{token}:browse"), InlineKeyboardButton("🌐 GitHub", url=data["html_url"])]]
+        data = response.json(); branch = data.get("default_branch", "main")
+        token = remember(context, {"kind": "github", "owner": owner, "repo": repo, "branch": branch})
+        keys = [[InlineKeyboardButton("⬇️ Download Source ZIP", callback_data=f"gh:{token}:source")], [InlineKeyboardButton("📖 Send README", callback_data=f"gh:{token}:readme"), InlineKeyboardButton("🏷 Release Downloads", callback_data=f"gh:{token}:releases")], [InlineKeyboardButton("📂 Browse & Download Files", callback_data=f"gh:{token}:browse")]]
         caption = f"📦 <b>{html.escape(data['full_name'])}</b>\n{html.escape(data.get('description') or 'No description')}\n\n⭐ {data.get('stargazers_count', 0):,} · 🍴 {data.get('forks_count', 0):,} · 🐞 {data.get('open_issues_count', 0):,}\n🌿 <code>{html.escape(branch)}</code>"
         await status.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keys))
     except requests.RequestException as exc:
@@ -276,24 +315,104 @@ async def github_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, url: s
 async def github_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query: return
-    await query.answer("Loading…"); _, token, action = query.data.split(":", 2); job = recall(context, token)
+    if not authorized(query.from_user.id):
+        await query.answer(text(query.from_user.id, "unauth"), show_alert=True); return
+    await query.answer("Loading…"); parts = query.data.split(":"); token, action = parts[1], parts[2]; job = recall(context, token)
     if not job: await query.message.reply_text("⌛ This menu expired. Send the link again."); return
     base = f"https://api.github.com/repos/{quote(job['owner'])}/{quote(job['repo'])}"
     try:
-        if action == "readme":
-            response = await api_get(f"{base}/readme"); link = response.json().get("html_url") if response.ok else None
-            await query.message.reply_text(f"📖 {link}" if link else "❌ No README found.")
+        if action == "source":
+            url = f"https://github.com/{job['owner']}/{job['repo']}/archive/refs/heads/{quote(job['branch'])}.zip"
+            source_name = f"{job['repo']}-{job['branch'].replace('/', '-')}.zip"
+            await send_remote_document(query.message, context, url, source_name)
+        elif action == "readme":
+            response = await api_get(f"{base}/readme")
+            if not response.ok:
+                await query.message.reply_text("❌ No README found."); return
+            data = response.json(); content = base64.b64decode(data.get("content", ""), validate=False)
+            DOWNLOAD_DIR.mkdir(exist_ok=True); work = Path(tempfile.mkdtemp(prefix="github-readme-", dir=DOWNLOAD_DIR))
+            try:
+                path = work / safe_filename(data.get("name", "README.md"), "README.md"); path.write_bytes(content)
+                with path.open("rb") as document:
+                    await context.bot.send_document(query.message.chat_id, document, caption=f"📖 {job['owner']}/{job['repo']} README")
+            finally:
+                shutil.rmtree(work, ignore_errors=True)
         elif action == "releases":
-            response = await api_get(f"{base}/releases", params={"per_page": 5}); items = response.json() if response.ok else []
-            lines = [f"🏷 <a href=\"{html.escape(item['html_url'])}\">{html.escape(item.get('name') or item['tag_name'])}</a>" for item in items]
-            await query.message.reply_text("\n".join(lines) or "🏷 No published releases yet.", parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-        else:
-            response = await api_get(f"{base}/contents"); items = response.json() if response.ok else []
-            if not isinstance(items, list): items = []
-            lines = [f"{'📁' if item['type'] == 'dir' else '📄'} <a href=\"{html.escape(item['html_url'])}\">{html.escape(item['name'])}</a>" for item in items[:40]]
-            await query.message.reply_text("\n".join(lines) or "❌ Contents unavailable.", parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    except (requests.RequestException, TelegramError) as exc:
+            response = await api_get(f"{base}/releases", params={"per_page": 10}); releases = response.json() if response.ok else []
+            if not releases:
+                await query.message.reply_text("🏷 No published releases. Use “Download Source ZIP” on the repository card."); return
+            buttons = []
+            for release in releases:
+                key = github_item(job, {"type": "release", "release": release})
+                label = safe_filename(release.get("name") or release.get("tag_name") or "Release")
+                buttons.append([InlineKeyboardButton(f"🏷 {label[:48]}", callback_data=f"gh:{token}:release:{key}")])
+            await query.message.reply_text("🏷 <b>Choose a release</b>\nAssets and source archives will be uploaded here.", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+        elif action == "release":
+            item = job.get("github_items", {}).get(parts[3]) if len(parts) > 3 else None
+            if not item or item.get("type") != "release":
+                await query.message.reply_text("⌛ This release menu expired."); return
+            release = item["release"]; buttons = []
+            for asset in release.get("assets", [])[:30]:
+                key = github_item(job, {"type": "download", "url": asset["browser_download_url"], "name": asset["name"]})
+                size = asset.get("size", 0) / 1024 / 1024
+                buttons.append([InlineKeyboardButton(f"📦 {asset['name'][:38]} · {size:.1f} MB", callback_data=f"gh:{token}:download:{key}")])
+            source_name = f"{job['repo']}-{release['tag_name'].replace('/', '-')}.zip"
+            key = github_item(job, {"type": "download", "url": release["zipball_url"], "name": source_name})
+            buttons.append([InlineKeyboardButton("🗜 Source code (ZIP)", callback_data=f"gh:{token}:download:{key}")])
+            await query.message.reply_text(f"🏷 <b>{html.escape(release.get('name') or release['tag_name'])}</b>\nChoose a file to receive in Telegram:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+        elif action == "download":
+            item = job.get("github_items", {}).get(parts[3]) if len(parts) > 3 else None
+            if not item or item.get("type") != "download":
+                await query.message.reply_text("⌛ This download expired."); return
+            await send_remote_document(query.message, context, item["url"], item["name"])
+        elif action == "browse":
+            await send_github_browser(query.message, job, token, "")
+        elif action == "path":
+            item = job.get("github_items", {}).get(parts[3]) if len(parts) > 3 else None
+            if not item or item.get("type") != "path":
+                await query.message.reply_text("⌛ This folder menu expired."); return
+            await send_github_browser(query.message, job, token, item["path"])
+    except (requests.RequestException, TelegramError, OSError, ValueError) as exc:
         log.warning("GitHub callback failed: %s", exc); await query.message.reply_text("❌ Could not load that view.")
+
+
+async def send_remote_document(message: Any, context: ContextTypes.DEFAULT_TYPE, url: str, filename: str, source: str = "GitHub") -> None:
+    filename = safe_filename(filename)
+    status = await message.reply_text(f"⬇️ Downloading <code>{html.escape(filename)}</code> from {html.escape(source)}…", parse_mode=ParseMode.HTML)
+    DOWNLOAD_DIR.mkdir(exist_ok=True); work = Path(tempfile.mkdtemp(prefix="github-", dir=DOWNLOAD_DIR))
+    try:
+        path = await asyncio.to_thread(download_http_file, url, work, filename)
+        await status.edit_text("📤 Uploading to Telegram…")
+        with path.open("rb") as document:
+            await context.bot.send_document(message.chat_id, document, caption=f"✅ {filename}", read_timeout=120, write_timeout=120)
+        await status.delete()
+    except (requests.RequestException, RuntimeError, OSError, TelegramError) as exc:
+        log.warning("GitHub file download failed: %s", exc)
+        await status.edit_text(f"❌ Could not send this file.\n<code>{html.escape(str(exc)[:350])}</code>", parse_mode=ParseMode.HTML)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+async def send_github_browser(message: Any, job: dict[str, Any], token: str, path: str) -> None:
+    base = f"https://api.github.com/repos/{quote(job['owner'])}/{quote(job['repo'])}/contents"
+    response = await api_get(f"{base}/{quote(path, safe='/')}" if path else base)
+    items = response.json() if response.ok else []
+    if not isinstance(items, list):
+        await message.reply_text("❌ This folder could not be loaded."); return
+    buttons = []
+    if path:
+        parent = "/".join(path.split("/")[:-1]); key = github_item(job, {"type": "path", "path": parent})
+        buttons.append([InlineKeyboardButton("⬆️ Parent folder", callback_data=f"gh:{token}:path:{key}")])
+    for item in sorted(items, key=lambda entry: (entry["type"] != "dir", entry["name"].lower()))[:40]:
+        if item["type"] == "dir":
+            key = github_item(job, {"type": "path", "path": item["path"]}); label = f"📁 {item['name'][:48]}"; action = "path"
+        else:
+            key = github_item(job, {"type": "download", "url": item.get("download_url") or item["url"], "name": item["name"]}); label = f"📄 {item['name'][:48]}"; action = "download"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"gh:{token}:{action}:{key}")])
+    if not buttons:
+        await message.reply_text("📂 This repository folder is empty."); return
+    location = f"/{path}" if path else "/"
+    await message.reply_text(f"📂 <b>{html.escape(job['owner'])}/{html.escape(job['repo'])}</b> <code>{html.escape(location)}</code>\nTap a file to receive it here:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def spotify_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str) -> None:
@@ -304,20 +423,32 @@ async def spotify_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, url: 
 
 async def media_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str) -> None:
     token = remember(context, {"kind": "media", "url": url})
-    keys = [[InlineKeyboardButton("🎬 Best video", callback_data=f"dl:{token}:best"), InlineKeyboardButton("📱 Upload-safe", callback_data=f"dl:{token}:safe")], [InlineKeyboardButton("🎧 MP3", callback_data=f"dl:{token}:mp3"), InlineKeyboardButton("🎼 M4A", callback_data=f"dl:{token}:m4a")]]
+    keys = [[InlineKeyboardButton("🎬 Best video", callback_data=f"dl:{token}:best"), InlineKeyboardButton("📱 Upload-safe", callback_data=f"dl:{token}:safe")], [InlineKeyboardButton("🎧 MP3", callback_data=f"dl:{token}:mp3"), InlineKeyboardButton("🎼 M4A", callback_data=f"dl:{token}:m4a")], [InlineKeyboardButton("📎 Send original file", callback_data=f"dl:{token}:direct")]]
     await update.message.reply_text("🔗 <b>Media link detected</b>\nChoose a format. Playlists are supported up to the configured limit.", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keys))
 
 
-async def playstore(update: Update, url: str) -> None:
+async def playstore(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str) -> None:
     app_id = parse_qs(urlparse(url).query).get("id", [""])[0]; status = await update.message.reply_text(text(update.effective_user.id, "fetching"))
     if not app_id: await status.edit_text("❌ This link has no application ID."); return
     try:
         data = await asyncio.to_thread(play_app, app_id)
-        keys = [[InlineKeyboardButton("▶️ Google Play", url=url)], [InlineKeyboardButton("🔎 APKMirror", url=f"https://www.apkmirror.com/?post_type=app_release&searchtype=apk&s={quote(app_id)}")]]
+        token = remember(context, {"kind": "apk", "url": f"https://d.apkpure.com/b/APK/{quote(app_id)}?version=latest", "name": f"{app_id}.apk"})
+        keys = [[InlineKeyboardButton("⬇️ Send latest APK", callback_data=f"apk:{token}")]]
         caption = f"📱 <b>{html.escape(data['title'])}</b>\n🏢 {html.escape(data.get('developer', 'Unknown'))}\n⭐ {data.get('score') or 'N/A'} · ⬇️ {html.escape(data.get('installs', 'N/A'))}\n\n{html.escape((data.get('summary') or '')[:500])}"
         await status.delete(); await update.message.reply_photo(data["icon"], caption=caption, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keys))
     except Exception as exc:
         log.warning("Play lookup failed: %s", exc); await status.edit_text("❌ App details could not be loaded.")
+
+
+async def apk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query: return
+    if not authorized(query.from_user.id):
+        await query.answer(text(query.from_user.id, "unauth"), show_alert=True); return
+    await query.answer(); job = recall(context, query.data.split(":", 1)[1])
+    if not job or job.get("kind") != "apk":
+        await query.message.reply_text("⌛ This APK download expired. Send the Google Play link again."); return
+    await send_remote_document(query.message, context, job["url"], job["name"], "APK provider")
 
 
 def ytdlp_options(action: str, output: Path) -> dict[str, Any]:
@@ -363,6 +494,10 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not authorized(uid): await query.answer(text(uid, "unauth"), show_alert=True); return
     await query.answer(); _, token, action = query.data.split(":", 2); job = recall(context, token)
     if not job: await query.message.reply_text("⌛ This menu expired. Send the link again."); return
+    if action == "direct":
+        filename = safe_filename(unquote(Path(urlparse(job["url"]).path).name), "download.bin")
+        await send_remote_document(query.message, context, job["url"], filename, "source website")
+        return
     status = await query.message.reply_text(text(uid, "wait")); DOWNLOAD_DIR.mkdir(exist_ok=True); work = Path(tempfile.mkdtemp(prefix=f"{uid}-", dir=DOWNLOAD_DIR))
     global DOWNLOAD_SEMAPHORE
     if DOWNLOAD_SEMAPHORE is None: DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
@@ -399,8 +534,9 @@ def main() -> None:
     for command, callback in (("start", start), ("help", help_command), ("status", status_command), ("id", id_command), ("allow", allow_command), ("revoke", revoke_command), ("users", users_command)): app.add_handler(CommandHandler(command, callback))
     app.add_handler(MessageHandler(filters.StatusUpdate.USERS_SHARED, user_shared))
     app.add_handler(CallbackQueryHandler(language_callback, pattern=r"^lang:(en|fa|ru|zh)$"))
-    app.add_handler(CallbackQueryHandler(github_callback, pattern=r"^gh:[a-f0-9]{10}:(readme|releases|browse)$"))
-    app.add_handler(CallbackQueryHandler(download_callback, pattern=r"^dl:[a-f0-9]{10}:(best|safe|mp3|m4a|sp3|sfl)$"))
+    app.add_handler(CallbackQueryHandler(github_callback, pattern=r"^gh:[a-f0-9]{10}:(source|readme|releases|browse|release:[a-f0-9]{8}|download:[a-f0-9]{8}|path:[a-f0-9]{8})$"))
+    app.add_handler(CallbackQueryHandler(apk_callback, pattern=r"^apk:[a-f0-9]{10}$"))
+    app.add_handler(CallbackQueryHandler(download_callback, pattern=r"^dl:[a-f0-9]{10}:(best|safe|mp3|m4a|direct|sp3|sfl)$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message)); app.add_error_handler(error_handler)
     log.info("OmniFetch is running"); app.run_polling(allowed_updates=Update.ALL_TYPES)
 

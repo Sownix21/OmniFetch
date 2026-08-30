@@ -6,11 +6,12 @@ OmniFetch is a private, interactive Telegram bot for media downloads and useful 
 
 - 🎬 Best-video and upload-safe video choices
 - 🎧 MP3, M4A, Spotify MP3, and FLAC choices
+- 📎 Direct in-chat delivery for original image, media, archive, and document URLs
 - 📚 Playlist support with a configurable item limit
 - 🌐 Generic yt-dlp routing instead of a fragile hardcoded site list
 - 🔞 Age-restricted/adult sites when supported by the installed yt-dlp extractor; cookies may be required
-- 📦 GitHub repository details, correct default-branch ZIP, README, releases, and file browser
-- 📱 Google Play details with official and APKMirror links
+- 📦 GitHub repository details plus in-chat downloads for source ZIPs, READMEs, release assets, and browsed files
+- 📱 Google Play details with in-chat APK delivery through a third-party APK provider
 - 🌍 English, Persian, Russian, and Chinese menus
 - 👑 Private allow-list with interactive and command-based admin controls
 - 🔒 Private-network URL blocking, isolated jobs, concurrency limits, and automatic cleanup

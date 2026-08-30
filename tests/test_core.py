@@ -18,6 +18,9 @@ class UrlTests(unittest.TestCase):
         self.assertFalse(valid)
         self.assertIn("Local", reason)
 
+    def test_safe_filename_removes_path_and_unsafe_characters(self):
+        self.assertEqual(bot.safe_filename("../../release<1>.zip"), "release_1_.zip")
+
 
 class DownloadOptionTests(unittest.TestCase):
     def test_playlist_limit_and_cookie_configuration(self):
