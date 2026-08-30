@@ -261,14 +261,17 @@ done
 systemctl is-active --quiet "$API_SERVICE" || die "Local Bot API service failed. Run: journalctl -u $API_SERVICE"
 
 health_config="$(mktemp)"; TEMP_FILES+=("$health_config"); chmod 600 "$health_config"
-printf 'url = "%s/bot%s/getMe"\nsilent\nshow-error\nfail\n' "$API_URL" "$BOT_TOKEN_VALUE" >"$health_config"
-for _ in $(seq 1 30); do
-    health_response="$(curl --config "$health_config" 2>/dev/null || true)"
+printf 'url = "%s/bot%s/getMe"\nsilent\nshow-error\n' "$API_URL" "$BOT_TOKEN_VALUE" >"$health_config"
+for _ in $(seq 1 120); do
+    health_response="$(curl --config "$health_config" 2>&1 || true)"
     [[ "$health_response" == *'"ok":true'* ]] && break
     sleep 2
 done
 rm -f "$health_config"
-[[ "${health_response:-}" == *'"ok":true'* ]] || die "Local Bot API started but could not authenticate the bot. Check API ID/hash and service logs."
+if [[ "${health_response:-}" != *'"ok":true'* ]]; then
+    safe_health_response="${health_response//$BOT_TOKEN_VALUE/[BOT_TOKEN_REDACTED]}"
+    die "Local Bot API authentication failed. Response: ${safe_health_response:-no response}. Check: journalctl -u $API_SERVICE -n 100 --no-pager"
+fi
 touch "$MIGRATION_MARKER"; chown "$API_USER:$API_USER" "$MIGRATION_MARKER"
 
 systemctl restart "$BOT_SERVICE"

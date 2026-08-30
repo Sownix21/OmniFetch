@@ -139,6 +139,23 @@ Telegram requires a one-time `logOut` call before a bot moves from the hosted AP
 
 The local API credentials are infrastructure credentials, not end-user login credentials. Other people can use this bot only after the administrator authorizes their Telegram IDs; they never receive the API ID/hash.
 
+### Local API authentication troubleshooting
+
+If installation reports a local authentication failure, inspect the service first:
+
+```bash
+sudo systemctl status telegram-bot-api --no-pager
+sudo journalctl -u telegram-bot-api -n 100 --no-pager
+```
+
+Verify that the API ID is numeric and the hash is 32 hexadecimal characters without printing the secret:
+
+```bash
+sudo awk -F= '/TELEGRAM_API_ID/{print "API ID:",$2} /TELEGRAM_API_HASH/{print "API hash length:",length($2)}' /etc/omnifetch-bot-api.env
+```
+
+Correct credentials with `sudo omnifetch api-config`, or rerun the installer. The health check waits up to four minutes for first-time authorization and reports Telegram's response with the bot token redacted.
+
 ## Contributing
 
 Run the checks before opening a pull request:

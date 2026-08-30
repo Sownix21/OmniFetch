@@ -38,14 +38,16 @@ wait_for_api() {
     token="$(read_key "$INSTALL_DIR/.env" BOT_TOKEN)"
     [[ -n "$token" ]] || { echo "❌ BOT_TOKEN is missing."; return 1; }
     curl_config="$(mktemp)"; TEMP_FILES+=("$curl_config"); chmod 600 "$curl_config"
-    printf 'url = "%s/bot%s/getMe"\nsilent\nshow-error\nfail\n' "$API_URL" "$token" >"$curl_config"
-    for _ in $(seq 1 30); do
-        response="$(curl --config "$curl_config" 2>/dev/null || true)"
+    printf 'url = "%s/bot%s/getMe"\nsilent\nshow-error\n' "$API_URL" "$token" >"$curl_config"
+    for _ in $(seq 1 120); do
+        response="$(curl --config "$curl_config" 2>&1 || true)"
         if [[ "$response" == *'"ok":true'* ]]; then rm -f "$curl_config"; return 0; fi
         sleep 2
     done
     rm -f "$curl_config"
-    echo "❌ The private Bot API did not become ready. Inspect: sudo omnifetch api-logs"
+    response="${response//$token/[BOT_TOKEN_REDACTED]}"
+    echo "❌ The private Bot API did not become ready: ${response:-no response}"
+    echo "Inspect: sudo omnifetch api-logs"
     return 1
 }
 
