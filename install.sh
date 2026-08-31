@@ -10,7 +10,8 @@ API_USER="telegram-bot-api"
 API_SOURCE_DIR="/usr/local/src/telegram-bot-api"
 API_DATA_DIR="/var/lib/telegram-bot-api"
 API_ENV_FILE="/etc/omnifetch-bot-api.env"
-API_URL="http://127.0.0.1:8081"
+API_PORT="${BOT_API_PORT:-18081}"
+API_URL="http://127.0.0.1:${API_PORT}"
 
 green='\033[0;32m'; blue='\033[0;34m'; red='\033[0;31m'; reset='\033[0m'
 say() { printf '%b\n' "${blue}🌌 $*${reset}"; }
@@ -65,11 +66,13 @@ API_HASH_VALUE="$(prompt_value "${TELEGRAM_API_HASH:-$EXISTING_API_HASH}" "🔐 
 [[ "$ADMIN_ID_VALUE" =~ ^[0-9]+$ ]] || die "ADMIN_ID must contain digits only."
 [[ "$API_ID_VALUE" =~ ^[0-9]+$ ]] || die "TELEGRAM_API_ID must contain digits only."
 [[ "$API_HASH_VALUE" =~ ^[A-Fa-f0-9]{32}$ ]] || die "TELEGRAM_API_HASH must be exactly 32 hexadecimal characters."
+[[ "$API_PORT" =~ ^[0-9]+$ ]] && (( API_PORT >= 1024 && API_PORT <= 65535 )) || \
+    die "BOT_API_PORT must be a number from 1024 through 65535."
 
 say "Installing runtime and official Bot API build dependencies"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq python3 python3-venv python3-pip ffmpeg git curl ca-certificates nano unzip \
+apt-get install -y -qq python3 python3-venv python3-pip ffmpeg git curl ca-certificates nano unzip iproute2 \
     cmake g++ make gperf zlib1g-dev libssl-dev
 python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' || \
     die "Python 3.10+ is required."
@@ -145,7 +148,7 @@ Type=simple
 User=${API_USER}
 Group=${API_USER}
 EnvironmentFile=${API_ENV_FILE}
-ExecStart=/usr/local/bin/telegram-bot-api --local --http-ip-address=127.0.0.1 --http-port=8081 --dir=${API_DATA_DIR} --temp-dir=${API_DATA_DIR}/tmp
+ExecStart=/usr/local/bin/telegram-bot-api --local --http-ip-address=127.0.0.1 --http-port=${API_PORT} --dir=${API_DATA_DIR} --temp-dir=${API_DATA_DIR}/tmp
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=60
@@ -240,6 +243,11 @@ EOF
 
 systemctl daemon-reload
 systemctl enable "$API_SERVICE" "$BOT_SERVICE"
+systemctl stop "$BOT_SERVICE" "$API_SERVICE" 2>/dev/null || true
+if ss -H -ltn "sport = :${API_PORT}" | grep -q LISTEN; then
+    owner="$(ss -H -ltnp "sport = :${API_PORT}" 2>/dev/null | head -n 1)"
+    die "Port ${API_PORT} is already occupied: ${owner:-unknown process}. Choose another with BOT_API_PORT=18082."
+fi
 
 BOT_ID="${BOT_TOKEN_VALUE%%:*}"
 MIGRATION_MARKER="$API_DATA_DIR/.omnifetch-migrated-${BOT_ID}"
@@ -277,5 +285,5 @@ touch "$MIGRATION_MARKER"; chown "$API_USER:$API_USER" "$MIGRATION_MARKER"
 systemctl restart "$BOT_SERVICE"
 systemctl is-active --quiet "$BOT_SERVICE" || die "OmniFetch failed to start. Run: journalctl -u $BOT_SERVICE"
 RESTORE_BOT_ON_FAILURE=false
-ok "OmniFetch is running through a loopback-only local Bot API with intact uploads up to 1900 MB."
+ok "OmniFetch is running through a loopback-only local Bot API at ${API_URL}, with intact uploads up to 1900 MB."
 ok "Use 'sudo omnifetch' for management."

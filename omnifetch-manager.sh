@@ -7,7 +7,7 @@ API_SERVICE="telegram-bot-api"
 API_ENV_FILE="/etc/omnifetch-bot-api.env"
 API_SOURCE_DIR="/usr/local/src/telegram-bot-api"
 API_DATA_DIR="/var/lib/telegram-bot-api"
-API_URL="http://127.0.0.1:8081"
+DEFAULT_API_URL="http://127.0.0.1:18081"
 
 if [[ ${EUID} -ne 0 ]]; then exec sudo "$0" "$@"; fi
 pause() { read -r -p "Press Enter to continue…" </dev/tty || true; }
@@ -34,11 +34,13 @@ check_install() {
 }
 
 wait_for_api() {
-    local token response curl_config
+    local token response curl_config api_url
     token="$(read_key "$INSTALL_DIR/.env" BOT_TOKEN)"
+    api_url="$(read_key "$INSTALL_DIR/.env" BOT_API_URL)"
+    api_url="${api_url:-$DEFAULT_API_URL}"
     [[ -n "$token" ]] || { echo "❌ BOT_TOKEN is missing."; return 1; }
     curl_config="$(mktemp)"; TEMP_FILES+=("$curl_config"); chmod 600 "$curl_config"
-    printf 'url = "%s/bot%s/getMe"\nsilent\nshow-error\n' "$API_URL" "$token" >"$curl_config"
+    printf 'url = "%s/bot%s/getMe"\nsilent\nshow-error\n' "$api_url" "$token" >"$curl_config"
     for _ in $(seq 1 120); do
         response="$(curl --config "$curl_config" 2>&1 || true)"
         if [[ "$response" == *'"ok":true'* ]]; then rm -f "$curl_config"; return 0; fi

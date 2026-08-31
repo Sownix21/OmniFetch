@@ -89,7 +89,7 @@ FFmpeg and a current supported JavaScript runtime are required on `PATH`. Deno 2
 |---|---:|---:|---|
 | `BOT_TOKEN` | yes | — | Token issued by BotFather |
 | `ADMIN_ID` | yes | — | Numeric Telegram user ID of the owner |
-| `BOT_API_URL` | no | empty | Root URL of a self-hosted Bot API server, e.g. `http://127.0.0.1:8081` |
+| `BOT_API_URL` | no | empty | Root URL of a self-hosted Bot API server, e.g. `http://127.0.0.1:18081` |
 | `GITHUB_TOKEN` | no | empty | Raises GitHub API limits for repository previews |
 | `COOKIES_FILE` | no | empty | Netscape-format cookies file for sites requiring login/age verification |
 | `MAX_UPLOAD_MB` | no | `49` hosted / `1900` local | Single-file ceiling, automatically clamped for the selected API mode |
@@ -128,7 +128,7 @@ The admin panel also uses Telegram's interactive user picker when the client sup
 
 The one-line installer configures large-file mode automatically:
 
-- `telegram-bot-api` runs as its own unprivileged user and listens only on `127.0.0.1:8081`; it is not exposed to the internet.
+- `telegram-bot-api` runs as its own unprivileged user and listens only on `127.0.0.1:18081`; it is not exposed to the internet. Set `BOT_API_PORT` during installation to choose another private port.
 - `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` live in `/etc/omnifetch-bot-api.env`, owned by root with mode `0600`. They are not placed in the bot's `.env` or source tree.
 - OmniFetch runs under a different unprivileged user. Its `.env`, database, temporary downloads, and systemd processes use restrictive permissions and hardening.
 - The bot accepts only users approved by `ADMIN_ID`, `/allow`, or the administrator's interactive user picker.

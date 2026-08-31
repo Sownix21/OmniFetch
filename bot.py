@@ -64,7 +64,7 @@ if LOCAL_BOT_API:
     except ValueError:
         loopback_host = False
     if parsed_bot_api.scheme != "http" or not loopback_host or parsed_bot_api.path not in {"", "/"} or parsed_bot_api.username or parsed_bot_api.password or parsed_bot_api.query or parsed_bot_api.fragment:
-        raise SystemExit("BOT_API_URL must be a private loopback HTTP endpoint such as http://127.0.0.1:8081")
+        raise SystemExit("BOT_API_URL must be a private loopback HTTP endpoint such as http://127.0.0.1:18081")
 upload_setting = os.getenv("MAX_UPLOAD_MB", "").strip()
 if LOCAL_BOT_API and upload_setting in {"", "49"}:
     upload_setting = "1900"
@@ -738,7 +738,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(apk_callback, pattern=r"^apk:[a-f0-9]{10}$"))
     app.add_handler(CallbackQueryHandler(download_callback, pattern=r"^dl:[a-f0-9]{10}:(best|safe|mp3|m4a|direct|sp3|sfl)$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message)); app.add_error_handler(error_handler)
-    log.info("OmniFetch is running"); app.run_polling(allowed_updates=Update.ALL_TYPES)
+    log.info("OmniFetch is running")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, bootstrap_retries=-1)
 
 
 if __name__ == "__main__": main()
