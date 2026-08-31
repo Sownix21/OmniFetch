@@ -12,8 +12,8 @@ OmniFetch is a private, interactive Telegram bot for media downloads and useful 
 - 📚 Playlist support with a configurable item limit
 - 🌐 Generic yt-dlp routing instead of a fragile hardcoded site list
 - 🔞 Age-restricted/adult sites when supported by the installed yt-dlp extractor; cookies may be required
-- 📦 GitHub repository details plus in-chat downloads for source ZIPs, READMEs, release assets, and browsed files
-- 📱 Google Play details with in-chat APK delivery through a third-party APK provider
+- 📦 GitHub repository details plus labeled latest-stable/pre-release downloads, source ZIPs, READMEs, and browsed files
+- 📱 Google Play details with in-chat packages from direct Google Play (optional credentials), F-Droid, or a labeled APKPure mirror
 - 🌍 English, Persian, Russian, and Chinese menus
 - 👑 Private allow-list with interactive and command-based admin controls
 - 🔒 Private-network URL blocking, isolated jobs, concurrency limits, and automatic cleanup
@@ -35,7 +35,7 @@ The API ID/hash identify the local Bot API application on your VPS. They do not 
 curl -fsSL https://raw.githubusercontent.com/Sownix21/OmniFetch/main/install.sh | sudo bash
 ```
 
-The installer prompts safely through `/dev/tty`, installs a checksum-verified Deno runtime for current yt-dlp/YouTube support, builds Telegram's official local Bot API, performs the required one-time hosted-to-local migration, and starts both hardened systemd services. The first build can take several minutes.
+The installer prompts safely through `/dev/tty`, installs checksum-verified Deno and apkeep binaries for current YouTube and Android-package support, builds Telegram's official local Bot API, performs the required one-time hosted-to-local migration, and starts both hardened systemd services. The first build can take several minutes.
 
 For unattended installation:
 
@@ -92,6 +92,10 @@ FFmpeg and a current supported JavaScript runtime are required on `PATH`. Deno 2
 | `BOT_API_URL` | no | empty | Root URL of a self-hosted Bot API server, e.g. `http://127.0.0.1:18081` |
 | `GITHUB_TOKEN` | no | empty | Raises GitHub API limits for repository previews |
 | `COOKIES_FILE` | no | empty | Netscape-format cookies file for sites requiring login/age verification |
+| `GOOGLE_PLAY_EMAIL` | no | empty | Dedicated Google account email for direct Google Play downloads |
+| `GOOGLE_PLAY_TOKEN` | no | empty | apkeep AAS token or auth token; stored only in the mode-0600 server `.env` |
+| `GOOGLE_PLAY_TOKEN_TYPE` | no | `aas` | `aas` or `auth`, matching the supplied token |
+| `GOOGLE_PLAY_ACCEPT_TOS` | no | `false` | Pass apkeep's first-use Terms acceptance flag when explicitly enabled |
 | `MAX_UPLOAD_MB` | no | `49` hosted / `1900` local | Single-file ceiling, automatically clamped for the selected API mode |
 | `MAX_DOWNLOAD_MB` | no | `500` hosted / `1900` installer | Maximum file downloaded; never lower than the upload ceiling |
 | `MAX_PLAYLIST_ITEMS` | no | `10` | Maximum media items processed/sent per request |
@@ -101,7 +105,7 @@ FFmpeg and a current supported JavaScript runtime are required on `PATH`. Deno 2
 | `MIN_FREE_DISK_MB` | no | `1024` (`2048` installer) | Free space reserved while downloading |
 | `LOG_LEVEL` | no | `INFO` | Python logging level |
 
-Keep `.env` and cookie files private. A browser cookie export can grant account access; use a dedicated low-value account where possible and set restrictive file permissions. yt-dlp expects Netscape/Mozilla cookie-file format.
+Keep `.env` and cookie files private. Browser cookies and Google Play tokens can grant account access; use dedicated low-value accounts where possible and set restrictive file permissions. yt-dlp expects Netscape/Mozilla cookie-file format. Configure the optional Google Play values with `sudo omnifetch config`; without them, the bot still offers F-Droid and the explicitly labeled APKPure mirror.
 
 ## Bot commands
 
@@ -118,7 +122,9 @@ The admin panel also uses Telegram's interactive user picker when the client sup
 ## Notes and limitations
 
 - OmniFetch does not bypass DRM, paywalls, or access controls. Downloads must comply with local law and the source site's terms.
+- No downloader can guarantee every URL: deleted/private media, DRM, CAPTCHA, regional blocks, and extractor-breaking site changes can still prevent delivery. OmniFetch reports the provider's actual reason and supports cookies/browser impersonation where appropriate.
 - spotDL uses YouTube/YouTube Music as its audio source; selecting FLAC changes the container/encoding but cannot create quality absent from the source.
+- Direct Google Play requires account credentials and cannot retrieve paid or DRM-protected apps. APKPure is an independent third-party mirror; choose it only if you trust that source.
 - Some websites require fresh cookies, a compatible JavaScript runtime, or extractor updates. Use `sudo omnifetch update` first when a previously working site breaks.
 - The hosted Telegram Bot API accepts bot uploads only up to 50 MB. The official local server raises bot uploads to 2,000 MB; OmniFetch uses a conservative 1,900 MB ceiling. Files beyond Telegram's limit cannot be sent as one Telegram attachment.
 - OmniFetch can split ordinary files when hosted mode is used, but never splits APK/APKS/XAPK packages because those pieces are not installable.

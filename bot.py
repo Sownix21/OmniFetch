@@ -23,7 +23,6 @@ from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 
 import requests
-import yt_dlp
 from dotenv import load_dotenv
 from google_play_scraper import app as play_app
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton
@@ -50,6 +49,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = env_int("ADMIN_ID", 0)
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip()
+GOOGLE_PLAY_EMAIL = os.getenv("GOOGLE_PLAY_EMAIL", "").strip()
+GOOGLE_PLAY_TOKEN = os.getenv("GOOGLE_PLAY_TOKEN", "").strip()
+GOOGLE_PLAY_TOKEN_TYPE = os.getenv("GOOGLE_PLAY_TOKEN_TYPE", "aas").strip().lower()
+GOOGLE_PLAY_ACCEPT_TOS = os.getenv("GOOGLE_PLAY_ACCEPT_TOS", "false").strip().lower() in {"1", "true", "yes"}
 BOT_API_URL = os.getenv("BOT_API_URL", "").strip().rstrip("/")
 LOCAL_BOT_API = bool(BOT_API_URL)
 if LOCAL_BOT_API:
@@ -80,10 +83,12 @@ REQUEST_TIMEOUT = max(5, env_int("REQUEST_TIMEOUT", 20))
 TRANSFER_TIMEOUT = max(120, env_int("TRANSFER_TIMEOUT", 3600 if LOCAL_BOT_API else 180))
 MIN_FREE_DISK_MB = max(256, env_int("MIN_FREE_DISK_MB", 1024))
 URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
+ANDROID_APP_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+$")
 LANGS = {"en", "fa", "ru", "zh"}
 DB_LOCK = threading.RLock()
 DOWNLOAD_SEMAPHORE: asyncio.Semaphore | None = None
 ACTIVE_DOWNLOADS: set[int] = set()
+YTDLP_FILE_MARKER = "__OMNIFETCH_FILE__"
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("omnifetch")
@@ -436,10 +441,22 @@ async def github_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if not releases:
                 await query.message.reply_text("🏷 No published releases. Use “Download Source ZIP” on the repository card."); return
             buttons = []
+            stable_id = next((release.get("id") for release in releases if not release.get("draft") and not release.get("prerelease")), None)
+            newest_id = next((release.get("id") for release in releases if not release.get("draft")), None)
             for release in releases:
+                release = dict(release)
+                if release.get("draft"):
+                    status_label = "📝 Draft"
+                elif release.get("prerelease"):
+                    status_label = "🧪 Latest pre-release" if release.get("id") == newest_id else "🧪 Pre-release"
+                elif release.get("id") == stable_id:
+                    status_label = "✅ Latest stable"
+                else:
+                    status_label = "🏷 Stable"
+                release["omnifetch_status"] = status_label
                 key = github_item(job, {"type": "release", "release": release})
                 label = safe_filename(release.get("name") or release.get("tag_name") or "Release")
-                buttons.append([InlineKeyboardButton(f"🏷 {label[:48]}", callback_data=f"gh:{token}:release:{key}")])
+                buttons.append([InlineKeyboardButton(f"{status_label} · {label[:34]}", callback_data=f"gh:{token}:release:{key}")])
             await query.message.reply_text("🏷 <b>Choose a release</b>\nAssets and source archives will be uploaded here.", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
         elif action == "release":
             item = job.get("github_items", {}).get(parts[3]) if len(parts) > 3 else None
@@ -453,7 +470,14 @@ async def github_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             source_name = f"{job['repo']}-{release['tag_name'].replace('/', '-')}.zip"
             key = github_item(job, {"type": "download", "url": release["zipball_url"], "name": source_name})
             buttons.append([InlineKeyboardButton("🗜 Source code (ZIP)", callback_data=f"gh:{token}:download:{key}")])
-            await query.message.reply_text(f"🏷 <b>{html.escape(release.get('name') or release['tag_name'])}</b>\nChoose a file to receive in Telegram:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+            status_label = release.get("omnifetch_status", "🏷 Release")
+            published = (release.get("published_at") or release.get("created_at") or "")[:10]
+            await query.message.reply_text(
+                f"{html.escape(status_label)}\n<b>{html.escape(release.get('name') or release['tag_name'])}</b>\n"
+                f"🏷 <code>{html.escape(release.get('tag_name', ''))}</code>"
+                f"{f' · 📅 {published}' if published else ''}\nChoose a file to receive in Telegram:",
+                parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons),
+            )
         elif action == "download":
             item = job.get("github_items", {}).get(parts[3]) if len(parts) > 3 else None
             if not item or item.get("type") != "download":
@@ -573,15 +597,25 @@ async def media_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, url: st
 
 async def playstore(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str) -> None:
     app_id = parse_qs(urlparse(url).query).get("id", [""])[0]; status = await update.message.reply_text(text(update.effective_user.id, "fetching"))
-    if not app_id: await status.edit_text("❌ This link has no application ID."); return
+    if not ANDROID_APP_ID_RE.fullmatch(app_id): await status.edit_text("❌ This link has no valid Android application ID."); return
+    token = remember(context, {"kind": "apk", "app_id": app_id, "name": f"{app_id}.apk"})
+    keys = []
+    if GOOGLE_PLAY_EMAIL and GOOGLE_PLAY_TOKEN:
+        keys.append([InlineKeyboardButton("🛡 Google Play (direct)", callback_data=f"apk:{token}:google")])
+    keys.append([InlineKeyboardButton("📦 APKPure mirror", callback_data=f"apk:{token}:apkpure"), InlineKeyboardButton("♻️ F-Droid", callback_data=f"apk:{token}:fdroid")])
+    markup = InlineKeyboardMarkup(keys)
     try:
         data = await asyncio.to_thread(play_app, app_id)
-        token = remember(context, {"kind": "apk", "url": f"https://d.apkpure.com/b/APK/{quote(app_id)}?version=latest", "name": f"{app_id}.apk"})
-        keys = [[InlineKeyboardButton("⬇️ Send latest APK", callback_data=f"apk:{token}")]]
         caption = f"📱 <b>{html.escape(data['title'])}</b>\n🏢 {html.escape(data.get('developer', 'Unknown'))}\n⭐ {data.get('score') or 'N/A'} · ⬇️ {html.escape(data.get('installs', 'N/A'))}\n\n{html.escape((data.get('summary') or '')[:500])}"
-        await status.delete(); await update.message.reply_photo(data["icon"], caption=caption, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keys))
+        if not (GOOGLE_PLAY_EMAIL and GOOGLE_PLAY_TOKEN):
+            caption += "\n\nℹ️ Direct Google Play download needs optional server credentials; mirror choices are shown below."
+        await status.delete(); await update.message.reply_photo(data["icon"], caption=caption, parse_mode=ParseMode.HTML, reply_markup=markup)
     except Exception as exc:
-        log.warning("Play lookup failed: %s", exc); await status.edit_text("❌ App details could not be loaded.")
+        log.warning("Play metadata lookup failed for %s: %s", app_id, exc)
+        await status.edit_text(
+            f"📱 <b>{html.escape(app_id)}</b>\nMetadata could not be loaded, but package providers are still available:",
+            parse_mode=ParseMode.HTML, reply_markup=markup,
+        )
 
 
 async def apk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -589,24 +623,33 @@ async def apk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not query: return
     if not authorized(query.from_user.id):
         await query.answer(text(query.from_user.id, "unauth"), show_alert=True); return
-    await query.answer(); job = recall(context, query.data.split(":", 1)[1])
+    await query.answer(); _, token, provider = query.data.split(":", 2); job = recall(context, token)
     if not job or job.get("kind") != "apk":
         await query.message.reply_text("⌛ This APK download expired. Send the Google Play link again."); return
-    await send_remote_document(query.message, context, job["url"], job["name"], "APK provider")
+    uid = query.from_user.id
+    if uid in ACTIVE_DOWNLOADS:
+        await query.message.reply_text("⏳ You already have an active download. Please wait for it to finish."); return
+    ACTIVE_DOWNLOADS.add(uid); status = await query.message.reply_text("⬇️ Downloading the Android package…"); work: Path | None = None
+    try:
+        ensure_download_capacity(); DOWNLOAD_DIR.mkdir(exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix=f"apk-{uid}-", dir=DOWNLOAD_DIR))
+        source = {"google": "google-play", "apkpure": "apk-pure", "fdroid": "f-droid"}[provider]
+        async with download_semaphore():
+            found = await run_apkeep(job["app_id"], source, work)
+        await status.edit_text("📤 Package downloaded. Uploading to Telegram…")
+        sent = 0
+        for path in found:
+            sent += bool(await upload(context, query.message.chat_id, path))
+        await status.edit_text(f"✅ Sent {sent} package file(s)." if sent else "⚠️ The package exceeded the configured upload limit.")
+    except (RuntimeError, OSError, TelegramError) as exc:
+        log.warning("APK download failed for %s: %s", job.get("app_id"), exc)
+        await status.edit_text(f"❌ APK download failed.\n<code>{html.escape(str(exc)[:500])}</code>", parse_mode=ParseMode.HTML)
+    finally:
+        if work: shutil.rmtree(work, ignore_errors=True)
+        ACTIVE_DOWNLOADS.discard(uid)
 
 
-def ytdlp_options(action: str, output: Path) -> dict[str, Any]:
-    limit = MAX_UPLOAD_MB * 1024 * 1024
-    opts: dict[str, Any] = {"outtmpl": str(output / "%(playlist_index&{} - |)s%(title).180B [%(id)s].%(ext)s"), "quiet": True, "no_warnings": True, "playlistend": MAX_PLAYLIST_ITEMS, "windowsfilenames": True, "retries": 3, "fragment_retries": 3, "socket_timeout": REQUEST_TIMEOUT, "max_filesize": MAX_DOWNLOAD_MB * 1024 * 1024}
-    if COOKIES_FILE: opts["cookiefile"] = COOKIES_FILE
-    if action == "best": opts.update({"format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best", "merge_output_format": "mp4"})
-    elif action == "safe": opts.update({"format": f"best[filesize<={limit}]/best[filesize_approx<={limit}]/bestvideo[filesize<={int(limit*.82)}]+bestaudio[filesize<={int(limit*.18)}]/best", "merge_output_format": "mp4", "max_filesize": limit})
-    elif action == "mp3": opts.update({"format": "bestaudio/best", "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "320"}]})
-    else: opts.update({"format": "bestaudio[ext=m4a]/bestaudio/best", "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "m4a"}]})
-    return opts
-
-
-async def run_subprocess(args: list[str], timeout: int = TRANSFER_TIMEOUT) -> str:
+async def run_subprocess_result(args: list[str], timeout: int = TRANSFER_TIMEOUT) -> tuple[int, str]:
     process = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
     try:
         stdout, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
@@ -614,9 +657,81 @@ async def run_subprocess(args: list[str], timeout: int = TRANSFER_TIMEOUT) -> st
         process.kill(); await process.communicate()
         raise RuntimeError(f"Download process exceeded the {timeout}-second timeout") from exc
     output = stdout.decode(errors="replace")
-    if process.returncode:
-        raise RuntimeError(output[-600:].strip() or f"Download process exited with code {process.returncode}")
+    return process.returncode or 0, output
+
+
+async def run_subprocess(args: list[str], timeout: int = TRANSFER_TIMEOUT) -> str:
+    returncode, output = await run_subprocess_result(args, timeout)
+    if returncode:
+        raise RuntimeError(last_diagnostic(output) or f"Download process exited with code {returncode}")
     return output
+
+
+def last_diagnostic(output: str, fallback: str = "The provider returned no downloadable file") -> str:
+    lines = [re.sub(r"\x1b\[[0-9;]*m", "", line).strip() for line in output.splitlines()]
+    useful = [line for line in lines if line and not line.startswith(YTDLP_FILE_MARKER)]
+    errors = [line for line in useful if any(word in line.lower() for word in ("error", "failed", "forbidden", "unavailable", "login", "private", "drm"))]
+    return (errors[-1] if errors else useful[-1] if useful else fallback)[-700:]
+
+
+def files_from_markers(output: str, root: Path) -> list[Path]:
+    root = root.resolve(); found: list[Path] = []
+    for line in output.splitlines():
+        if not line.startswith(YTDLP_FILE_MARKER):
+            continue
+        candidate = Path(line[len(YTDLP_FILE_MARKER):].strip()).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            log.warning("Extractor reported an output outside its work directory: %s", candidate)
+            continue
+        if candidate.is_file() and candidate not in found:
+            found.append(candidate)
+    return found
+
+
+def ytdlp_command(action: str, output: Path, url: str, impersonate: bool = False) -> list[str]:
+    executable = shutil.which("yt-dlp") or str(Path(sys.executable).parent / ("yt-dlp.exe" if os.name == "nt" else "yt-dlp"))
+    if not Path(executable).exists():
+        raise RuntimeError("yt-dlp is not installed")
+    limit = MAX_UPLOAD_MB * 1024 * 1024
+    args = [
+        executable, "--ignore-config", "--no-progress", "--ignore-errors", "--windows-filenames",
+        "--playlist-end", str(MAX_PLAYLIST_ITEMS), "--retries", "5", "--fragment-retries", "5",
+        "--socket-timeout", str(REQUEST_TIMEOUT), "--max-filesize", f"{MAX_DOWNLOAD_MB}M",
+        "--print", f"after_move:{YTDLP_FILE_MARKER}%(filepath)s",
+        "--output", str(output / "%(playlist_index&{} - |)s%(title).180B [%(id)s].%(ext)s"),
+    ]
+    if COOKIES_FILE:
+        args.extend(["--cookies", COOKIES_FILE])
+    if impersonate:
+        args.extend(["--impersonate", "chrome"])
+    if action == "best":
+        args.extend(["--format", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best", "--merge-output-format", "mp4"])
+    elif action == "safe":
+        args.extend(["--format", f"best[filesize<={limit}]/best[filesize_approx<={limit}]/bestvideo[filesize<={int(limit*.82)}]+bestaudio[filesize<={int(limit*.18)}]/best", "--merge-output-format", "mp4", "--max-filesize", str(limit)])
+    elif action == "mp3":
+        args.extend(["--format", "bestaudio/best", "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0"])
+    else:
+        args.extend(["--format", "bestaudio[ext=m4a]/bestaudio/best", "--extract-audio", "--audio-format", "m4a"])
+    args.append(url)
+    return args
+
+
+async def run_ytdlp(url: str, action: str, output: Path) -> list[Path]:
+    _, first_output = await run_subprocess_result(ytdlp_command(action, output, url))
+    found = files_from_markers(first_output, output) or files_in(output)
+    if found:
+        return found
+    diagnostic = last_diagnostic(first_output)
+    retryable = any(word in diagnostic.lower() for word in ("403", "forbidden", "cloudflare", "impersonat", "blocked", "redirection"))
+    if retryable:
+        _, retry_output = await run_subprocess_result(ytdlp_command(action, output, url, impersonate=True))
+        found = files_from_markers(retry_output, output) or files_in(output)
+        if found:
+            return found
+        diagnostic = last_diagnostic(retry_output, diagnostic)
+    raise RuntimeError(diagnostic)
 
 
 def limit_spotdl_metadata(path: Path) -> int:
@@ -633,16 +748,58 @@ def limit_spotdl_metadata(path: Path) -> int:
     return original_count
 
 
-async def run_spotdl(url: str, fmt: str, output: Path) -> None:
+async def run_spotdl(url: str, fmt: str, output: Path) -> list[Path]:
     executable = shutil.which("spotdl") or str(Path(sys.executable).parent / ("spotdl.exe" if os.name == "nt" else "spotdl"))
     if not Path(executable).exists(): raise RuntimeError("spotDL is not installed")
     metadata = output / "selection.spotdl"
-    await run_subprocess([executable, "save", url, "--save-file", str(metadata)])
+    save_output = await run_subprocess([executable, "save", url, "--save-file", str(metadata)])
+    if not metadata.is_file():
+        raise RuntimeError(last_diagnostic(save_output, "Spotify returned no track metadata"))
     count = await asyncio.to_thread(limit_spotdl_metadata, metadata)
     if not count: raise RuntimeError("The Spotify link contained no downloadable tracks")
-    args = [executable, "download", str(metadata), "--format", fmt, "--threads", str(MAX_CONCURRENT_DOWNLOADS), "--output", str(output / "{artists} - {title}.{output-ext}"), "--yt-dlp-args", f"--max-filesize {MAX_DOWNLOAD_MB}M --socket-timeout {REQUEST_TIMEOUT}"]
+    args = [
+        executable, "download", str(metadata), "--format", fmt,
+        "--audio", "youtube-music", "youtube", "soundcloud", "bandcamp",
+        "--threads", str(MAX_CONCURRENT_DOWNLOADS),
+        "--output", str(output / "{artists} - {title}.{output-ext}"),
+        "--yt-dlp-args", f"--max-filesize {MAX_DOWNLOAD_MB}M --socket-timeout {REQUEST_TIMEOUT} --retries 5 --fragment-retries 5",
+    ]
+    if fmt == "mp3":
+        args.extend(["--bitrate", "320k"])
     if COOKIES_FILE: args.extend(["--cookie-file", COOKIES_FILE])
-    await run_subprocess(args)
+    download_output = await run_subprocess(args)
+    found = files_in(output)
+    if not found:
+        raise RuntimeError(last_diagnostic(download_output, "spotDL could not match this Spotify item to an available audio source"))
+    return found
+
+
+async def run_apkeep(app_id: str, provider: str, output: Path) -> list[Path]:
+    executable = shutil.which("apkeep") or "/usr/local/bin/apkeep"
+    if not Path(executable).exists():
+        raise RuntimeError("apkeep is not installed; run sudo omnifetch update")
+    args = [executable, "-a", app_id, "-d", provider]
+    if provider == "google-play":
+        if not GOOGLE_PLAY_EMAIL or not GOOGLE_PLAY_TOKEN:
+            raise RuntimeError("Direct Google Play needs GOOGLE_PLAY_EMAIL and GOOGLE_PLAY_TOKEN in the server .env")
+        if GOOGLE_PLAY_TOKEN_TYPE not in {"aas", "auth"}:
+            raise RuntimeError("GOOGLE_PLAY_TOKEN_TYPE must be aas or auth")
+        config = output / "apkeep.ini"
+        token_key = "aas_token" if GOOGLE_PLAY_TOKEN_TYPE == "aas" else "auth_token"
+        config.write_text(f"[google]\nemail = {GOOGLE_PLAY_EMAIL}\n{token_key} = {GOOGLE_PLAY_TOKEN}\n", encoding="utf-8")
+        try:
+            config.chmod(0o600)
+        except OSError:
+            pass
+        args.extend(["-i", str(config)])
+        if GOOGLE_PLAY_ACCEPT_TOS:
+            args.append("--accept-tos")
+    args.append(str(output))
+    provider_output = await run_subprocess(args)
+    found = [path for path in files_in(output) if path.suffix.lower() in {".apk", ".apks", ".xapk", ".obb"}]
+    if not found:
+        raise RuntimeError(last_diagnostic(provider_output, f"{provider} returned no installable package for {app_id}"))
+    return found
 
 
 def files_in(path: Path) -> list[Path]:
@@ -697,14 +854,14 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         work = Path(tempfile.mkdtemp(prefix=f"{uid}-", dir=DOWNLOAD_DIR))
         async with download_semaphore():
             await status.edit_text("⬇️ Downloading and processing…")
-            if job["kind"] == "spotify": await run_spotdl(job["url"], "flac" if action == "sfl" else "mp3", work)
-            else: await asyncio.to_thread(yt_dlp.YoutubeDL(ytdlp_options(action, work)).download, [job["url"]])
-        found = files_in(work)
-        if not found: raise RuntimeError("The extractor produced no downloadable file")
+            if job["kind"] == "spotify":
+                found = await run_spotdl(job["url"], "flac" if action == "sfl" else "mp3", work)
+            else:
+                found = await run_ytdlp(job["url"], action, work)
         await status.edit_text(text(uid, "uploading")); sent = 0
         for path in found[:MAX_PLAYLIST_ITEMS]: sent += bool(await upload(context, query.message.chat_id, path))
         await status.edit_text(f"✅ Done — sent {sent} of {len(found)} file(s)." if sent else "⚠️ Every file exceeded the upload limit.")
-    except (yt_dlp.utils.DownloadError, RuntimeError, OSError, TelegramError) as exc:
+    except (RuntimeError, OSError, TelegramError) as exc:
         log.warning("Download failed for %s: %s", uid, exc); detail = str(exc).splitlines()[-1][:350]
         hint = "\n\n💡 This site may require COOKIES_FILE." if any(word in detail.lower() for word in ("cookie", "sign in", "age")) else ""
         await status.edit_text(f"❌ Download failed.\n<code>{html.escape(detail)}</code>{hint}", parse_mode=ParseMode.HTML)
@@ -735,7 +892,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.StatusUpdate.USERS_SHARED, user_shared))
     app.add_handler(CallbackQueryHandler(language_callback, pattern=r"^lang:(en|fa|ru|zh)$"))
     app.add_handler(CallbackQueryHandler(github_callback, pattern=r"^gh:[a-f0-9]{10}:(source|readme|releases|browse|release:[a-f0-9]{8}|download:[a-f0-9]{8}|path:[a-f0-9]{8})$"))
-    app.add_handler(CallbackQueryHandler(apk_callback, pattern=r"^apk:[a-f0-9]{10}$"))
+    app.add_handler(CallbackQueryHandler(apk_callback, pattern=r"^apk:[a-f0-9]{10}:(google|apkpure|fdroid)$"))
     app.add_handler(CallbackQueryHandler(download_callback, pattern=r"^dl:[a-f0-9]{10}:(best|safe|mp3|m4a|direct|sp3|sfl)$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message)); app.add_error_handler(error_handler)
     log.info("OmniFetch is running")

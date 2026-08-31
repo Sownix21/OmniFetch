@@ -99,6 +99,29 @@ if [[ -z "$deno_version" || "$(printf '%s\n' 2.3.0 "$deno_version" | sort -V | h
 fi
 deno --version >/dev/null || die "Deno installation failed."
 
+say "Installing the maintained apkeep Android package downloader"
+case "$(uname -m)" in
+    x86_64|amd64) apkeep_asset="apkeep-x86_64-unknown-linux-gnu" ;;
+    aarch64|arm64) apkeep_asset="apkeep-aarch64-unknown-linux-gnu" ;;
+    armv7l) apkeep_asset="apkeep-armv7-unknown-linux-gnueabihf" ;;
+    *) die "apkeep automatic installation supports x86_64, ARM64, and ARMv7 VPS hosts." ;;
+esac
+apkeep_temp="$(mktemp -d)"; TEMP_DIRS+=("$apkeep_temp")
+curl -fsSL https://api.github.com/repos/EFForg/apkeep/releases/latest -o "$apkeep_temp/release.json"
+IFS=$'\t' read -r apkeep_url apkeep_digest < <(python3 - "$apkeep_temp/release.json" "$apkeep_asset" <<'PY'
+import json, sys
+release = json.load(open(sys.argv[1], encoding="utf-8"))
+asset = next((item for item in release.get("assets", []) if item.get("name") == sys.argv[2]), None)
+if not asset or not str(asset.get("digest", "")).startswith("sha256:"):
+    raise SystemExit(1)
+print(asset["browser_download_url"], asset["digest"].split(":", 1)[1], sep="\t")
+PY
+) || die "Could not find a checksum-published apkeep binary for this CPU architecture."
+curl -fsSL "$apkeep_url" -o "$apkeep_temp/apkeep"
+printf '%s  %s\n' "$apkeep_digest" "$apkeep_temp/apkeep" | sha256sum -c - >/dev/null || die "apkeep checksum verification failed."
+install -m 0755 "$apkeep_temp/apkeep" /usr/local/bin/apkeep
+/usr/local/bin/apkeep --version >/dev/null || die "apkeep installation failed."
+
 say "Installing OmniFetch from ${REPO_URL}"
 if [[ -d "$INSTALL_DIR/.git" ]]; then
     systemctl is-active --quiet "$BOT_SERVICE" 2>/dev/null && RESTORE_BOT_ON_FAILURE=true
@@ -216,6 +239,10 @@ copy_or_default MIN_FREE_DISK_MB 2048
 copy_or_default LOG_LEVEL INFO
 copy_or_default GITHUB_TOKEN ''
 copy_or_default COOKIES_FILE ''
+copy_or_default GOOGLE_PLAY_EMAIL ''
+copy_or_default GOOGLE_PLAY_TOKEN ''
+copy_or_default GOOGLE_PLAY_TOKEN_TYPE aas
+copy_or_default GOOGLE_PLAY_ACCEPT_TOS false
 mv "$NEW_ENV" "$INSTALL_DIR/.env"
 chown -R "$BOT_USER:$BOT_USER" "$INSTALL_DIR"
 chmod 600 "$INSTALL_DIR/.env"

@@ -46,16 +46,29 @@ class DownloadOptionTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "must be a whole number"):
                 bot.env_int("OMNIFETCH_TEST_INT", 1)
 
-    def test_playlist_limit_and_cookie_configuration(self):
-        with TemporaryDirectory() as directory:
-            options = bot.ytdlp_options("best", Path(directory))
-        self.assertEqual(options["playlistend"], bot.MAX_PLAYLIST_ITEMS)
-        self.assertEqual(options["merge_output_format"], "mp4")
+    def test_playlist_limit_and_safe_size_are_in_cli_command(self):
+        with TemporaryDirectory() as directory, patch.object(bot.shutil, "which", return_value=bot.sys.executable):
+            command = bot.ytdlp_command("safe", Path(directory), "https://example.com/video")
+        self.assertEqual(command[command.index("--playlist-end") + 1], str(bot.MAX_PLAYLIST_ITEMS))
+        self.assertIn(str(bot.MAX_UPLOAD_MB * 1024 * 1024), command)
 
-    def test_safe_mode_has_size_ceiling(self):
+    def test_ytdlp_command_reports_final_postprocessed_path(self):
+        with TemporaryDirectory() as directory, patch.object(bot.shutil, "which", return_value=bot.sys.executable):
+            command = bot.ytdlp_command("mp3", Path(directory), "https://example.com/watch?v=1")
+        self.assertIn(f"after_move:{bot.YTDLP_FILE_MARKER}%(filepath)s", command)
+        self.assertIn("--extract-audio", command)
+        self.assertEqual(command[-1], "https://example.com/watch?v=1")
+
+    def test_only_accepts_reported_files_inside_job_directory(self):
         with TemporaryDirectory() as directory:
-            options = bot.ytdlp_options("safe", Path(directory))
-        self.assertEqual(options["max_filesize"], bot.MAX_UPLOAD_MB * 1024 * 1024)
+            root = Path(directory)
+            media = root / "song.mp3"; media.write_bytes(b"audio")
+            outside = root.parent / "outside.mp3"; outside.write_bytes(b"outside")
+            try:
+                output = f"{bot.YTDLP_FILE_MARKER}{media}\n{bot.YTDLP_FILE_MARKER}{outside}\n"
+                self.assertEqual(bot.files_from_markers(output, root), [media.resolve()])
+            finally:
+                outside.unlink(missing_ok=True)
 
     def test_large_file_parts_reconstruct_exactly(self):
         with TemporaryDirectory() as directory:

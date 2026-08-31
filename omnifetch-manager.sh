@@ -53,6 +53,30 @@ wait_for_api() {
     return 1
 }
 
+install_apkeep() {
+    local asset release_file binary_file url digest
+    case "$(uname -m)" in
+        x86_64|amd64) asset="apkeep-x86_64-unknown-linux-gnu" ;;
+        aarch64|arm64) asset="apkeep-aarch64-unknown-linux-gnu" ;;
+        armv7l) asset="apkeep-armv7-unknown-linux-gnueabihf" ;;
+        *) echo "❌ Unsupported CPU architecture for apkeep."; return 1 ;;
+    esac
+    release_file="$(mktemp)"; binary_file="$(mktemp)"; TEMP_FILES+=("$release_file" "$binary_file")
+    curl -fsSL https://api.github.com/repos/EFForg/apkeep/releases/latest -o "$release_file"
+    IFS=$'\t' read -r url digest < <(python3 - "$release_file" "$asset" <<'PY'
+import json, sys
+release = json.load(open(sys.argv[1], encoding="utf-8"))
+asset = next((item for item in release.get("assets", []) if item.get("name") == sys.argv[2]), None)
+if not asset or not str(asset.get("digest", "")).startswith("sha256:"):
+    raise SystemExit(1)
+print(asset["browser_download_url"], asset["digest"].split(":", 1)[1], sep="\t")
+PY
+) || { echo "❌ Could not resolve a checksum-published apkeep release."; return 1; }
+    curl -fsSL "$url" -o "$binary_file"
+    printf '%s  %s\n' "$digest" "$binary_file" | sha256sum -c - >/dev/null || { echo "❌ apkeep checksum verification failed."; return 1; }
+    install -m 0755 "$binary_file" /usr/local/bin/apkeep
+}
+
 start_all() {
     check_install
     systemctl start "$API_SERVICE"
@@ -99,6 +123,9 @@ update_bot() {
     fi
     if ! "$INSTALL_DIR/venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt"; then
         systemctl start "$BOT_SERVICE"; echo "❌ Dependency update failed; the existing bot was restarted."; return 1
+    fi
+    if ! install_apkeep; then
+        systemctl start "$BOT_SERVICE"; echo "❌ Android downloader update failed; the existing bot was restarted."; return 1
     fi
     install -m 0755 "$INSTALL_DIR/omnifetch-manager.sh" /usr/local/bin/omnifetch
     chown -R omnifetch:omnifetch "$INSTALL_DIR"
@@ -168,6 +195,7 @@ health_check() {
     check_install
     "$INSTALL_DIR/venv/bin/python" -m py_compile "$INSTALL_DIR/bot.py"
     deno --version | head -n 1
+    apkeep --version
     systemctl is-active --quiet "$API_SERVICE" || { echo "❌ $API_SERVICE is not active."; return 1; }
     systemctl is-active --quiet "$BOT_SERVICE" || { echo "❌ $BOT_SERVICE is not active."; return 1; }
     wait_for_api
@@ -211,6 +239,7 @@ WARNING
         "/etc/systemd/system/${API_SERVICE}.service" \
         "$API_ENV_FILE" \
         /usr/local/bin/telegram-bot-api \
+        /usr/local/bin/apkeep \
         /usr/local/bin/omnifetch
     rm -rf -- "$INSTALL_DIR" "$API_SOURCE_DIR" "$API_DATA_DIR"
 
