@@ -76,6 +76,17 @@ status_all() {
     systemctl status "$API_SERVICE" "$BOT_SERVICE" --no-pager || true
 }
 
+api_logs() {
+    check_install
+    local file_log="$API_DATA_DIR/telegram-bot-api.log"
+    if [[ -f "$file_log" ]]; then
+        echo "📜 Following $file_log (Ctrl+C to return)"
+        tail -n 100 -F "$file_log"
+    else
+        journalctl -u "$API_SERVICE" -f
+    fi
+}
+
 update_bot() {
     check_install
     echo "⬇️ Updating OmniFetch"
@@ -238,7 +249,7 @@ MENU
             3) restart_all; echo "✅ Restarted both services."; sleep 1 ;;
             4) status_all; pause ;;
             5) journalctl -u "$BOT_SERVICE" -f || true ;;
-            6) journalctl -u "$API_SERVICE" -f || true ;;
+            6) api_logs || true ;;
             7) edit_bot_config || true; pause ;;
             8) edit_api_config || true; pause ;;
             9) update_bot; pause ;;
@@ -257,7 +268,7 @@ case "${1:-menu}" in
     restart) restart_all ;;
     status) status_all ;;
     logs) check_install; journalctl -u "$BOT_SERVICE" -f ;;
-    api-logs) check_install; journalctl -u "$API_SERVICE" -f ;;
+    api-logs) api_logs ;;
     update) update_bot ;;
     update-api) update_api ;;
     config) edit_bot_config ;;
