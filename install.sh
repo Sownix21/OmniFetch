@@ -10,6 +10,8 @@ API_USER="telegram-bot-api"
 API_SOURCE_DIR="/usr/local/src/telegram-bot-api"
 API_DATA_DIR="/var/lib/telegram-bot-api"
 API_ENV_FILE="/etc/omnifetch-bot-api.env"
+API_PORT_EXPLICIT=false
+[[ -n "${BOT_API_PORT+x}" ]] && API_PORT_EXPLICIT=true
 API_PORT="${BOT_API_PORT:-18081}"
 API_URL="http://127.0.0.1:${API_PORT}"
 
@@ -131,6 +133,22 @@ cmake -S "$API_SOURCE_DIR" -B "$API_SOURCE_DIR/build" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$API_SOURCE_DIR/build" --target install --parallel "${BOT_API_BUILD_JOBS:-2}"
 [[ -x /usr/local/bin/telegram-bot-api ]] || die "Telegram Bot API build completed without installing the binary."
 
+systemctl stop "$BOT_SERVICE" "$API_SERVICE" 2>/dev/null || true
+if ss -H -ltn "sport = :${API_PORT}" | grep -q LISTEN; then
+    if [[ "$API_PORT_EXPLICIT" == true ]]; then
+        owner="$(ss -H -ltnp "sport = :${API_PORT}" 2>/dev/null | head -n 1)"
+        die "Requested BOT_API_PORT ${API_PORT} is occupied: ${owner:-unknown process}."
+    fi
+    selected_port=""
+    for candidate in $(seq 18082 18100); do
+        if ! ss -H -ltn "sport = :${candidate}" | grep -q LISTEN; then selected_port="$candidate"; break; fi
+    done
+    [[ -n "$selected_port" ]] || die "No free local Bot API port was found from 18081 through 18100."
+    API_PORT="$selected_port"
+    API_URL="http://127.0.0.1:${API_PORT}"
+    say "Port 18081 is occupied; automatically selected ${API_PORT} for the private Bot API"
+fi
+
 say "Creating isolated service storage and credentials"
 install -d -m 0700 -o "$API_USER" -g "$API_USER" "$API_DATA_DIR" "$API_DATA_DIR/tmp"
 umask 077
@@ -243,7 +261,6 @@ EOF
 
 systemctl daemon-reload
 systemctl enable "$API_SERVICE" "$BOT_SERVICE"
-systemctl stop "$BOT_SERVICE" "$API_SERVICE" 2>/dev/null || true
 if ss -H -ltn "sport = :${API_PORT}" | grep -q LISTEN; then
     owner="$(ss -H -ltnp "sport = :${API_PORT}" 2>/dev/null | head -n 1)"
     die "Port ${API_PORT} is already occupied: ${owner:-unknown process}. Choose another with BOT_API_PORT=18082."
