@@ -4,6 +4,9 @@ OmniFetch is a private, interactive Telegram bot for media downloads and useful 
 
 ## Highlights
 
+See [provider architecture and SRC comparison](PROVIDER_ARCHITECTURE.md) for
+the selected handlers, fallback order, setup requirements and limits.
+
 - 🎬 Best-video and upload-safe video choices
 - 🎧 MP3, M4A, Spotify MP3, and FLAC choices
 - 📎 Direct in-chat delivery for original image, media, archive, and document URLs
@@ -92,6 +95,10 @@ FFmpeg and a current supported JavaScript runtime are required on `PATH`. Deno 2
 | `BOT_API_URL` | no | empty | Root URL of a self-hosted Bot API server, e.g. `http://127.0.0.1:18081` |
 | `GITHUB_TOKEN` | no | empty | Raises GitHub API limits for repository previews |
 | `COOKIES_FILE` | no | empty | Netscape-format cookies file for sites requiring login/age verification |
+| `IG_COOKIES_FILE`, `X_COOKIES_FILE` | no | empty | Site-specific cookie files overriding the general file |
+| `COBALT_API_URL` | no | empty | Existing Cobalt instance; empty disables this provider |
+| `COBALT_API_KEY` | no | empty | API key for that Cobalt instance, if required |
+| `MAX_JOB_MB` | no | file limit × item limit | Aggregate temporary download budget per job |
 | `GOOGLE_PLAY_EMAIL` | no | empty | Dedicated Google account email for direct Google Play downloads |
 | `GOOGLE_PLAY_TOKEN` | no | empty | apkeep AAS token or auth token; stored only in the mode-0600 server `.env` |
 | `GOOGLE_PLAY_TOKEN_TYPE` | no | `aas` | `aas` or `auth`, matching the supplied token |

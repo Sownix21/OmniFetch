@@ -4,3 +4,4 @@ spotdl>=4.2.4,<5
 python-dotenv>=1.0,<2
 yt-dlp[default,curl-cffi]>=2025.1.15
 google-play-scraper>=1.2.7,<2
+aiohttp>=3.10,<4

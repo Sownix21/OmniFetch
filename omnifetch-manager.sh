@@ -121,7 +121,7 @@ update_bot() {
     if ! git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR" pull --ff-only; then
         systemctl start "$BOT_SERVICE"; echo "❌ Git update failed; the existing bot was restarted."; return 1
     fi
-    if ! "$INSTALL_DIR/venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt"; then
+    if ! "$INSTALL_DIR/venv/bin/pip" install --upgrade -q -r "$INSTALL_DIR/requirements.txt"; then
         systemctl start "$BOT_SERVICE"; echo "❌ Dependency update failed; the existing bot was restarted."; return 1
     fi
     if ! install_apkeep; then
@@ -193,7 +193,7 @@ edit_api_config() {
 
 health_check() {
     check_install
-    "$INSTALL_DIR/venv/bin/python" -m py_compile "$INSTALL_DIR/bot.py"
+    "$INSTALL_DIR/venv/bin/python" -m compileall -q "$INSTALL_DIR/bot.py" "$INSTALL_DIR/providers"
     deno --version | head -n 1
     apkeep --version
     systemctl is-active --quiet "$API_SERVICE" || { echo "❌ $API_SERVICE is not active."; return 1; }

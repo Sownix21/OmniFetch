@@ -216,7 +216,7 @@ EOF
 say "Creating Python environment"
 python3 -m venv "$INSTALL_DIR/venv"
 "$INSTALL_DIR/venv/bin/python" -m pip install --quiet --upgrade pip wheel
-"$INSTALL_DIR/venv/bin/pip" install --quiet -r "$INSTALL_DIR/requirements.txt"
+"$INSTALL_DIR/venv/bin/pip" install --upgrade --quiet -r "$INSTALL_DIR/requirements.txt"
 
 if [[ -f "$INSTALL_DIR/.env" ]]; then
     cp -a "$INSTALL_DIR/.env" "$INSTALL_DIR/.env.backup"
@@ -239,6 +239,11 @@ copy_or_default MIN_FREE_DISK_MB 2048
 copy_or_default LOG_LEVEL INFO
 copy_or_default GITHUB_TOKEN ''
 copy_or_default COOKIES_FILE ''
+copy_or_default IG_COOKIES_FILE ''
+copy_or_default X_COOKIES_FILE ''
+copy_or_default COBALT_API_URL ''
+copy_or_default COBALT_API_KEY ''
+copy_or_default MAX_JOB_MB 19000
 copy_or_default GOOGLE_PLAY_EMAIL ''
 copy_or_default GOOGLE_PLAY_TOKEN ''
 copy_or_default GOOGLE_PLAY_TOKEN_TYPE aas

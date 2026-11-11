@@ -22,7 +22,7 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Validate Python
         run: |
-          python -m py_compile bot.py
+          python -m compileall -q bot.py providers
           python -m unittest discover -s tests -v
       - name: Validate Linux scripts
         run: bash -n install.sh omnifetch-manager.sh
